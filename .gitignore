@@ -1,0 +1,42 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+# JavaScript dependencies and generated bundles
+node_modules/
+.npm/
+.next/
+.nuxt/
+coverage/
+dist/
+# Android / Gradle generated and machine-specific files
+.gradle/
+.kotlin/
+build/
+local.properties
+*.apk
+*.aab
+*.idsig
+captures/
+.cxx/
+.externalNativeBuild/
+# Editors, temporary files, logs, and local databases
+.idea/
+.vscode/
+*.iml
+*.log
+*.tmp
+*.swp
+*.hprof
+*.sqlite3
+*.sqlite3-*
+.DS_Store
+Thumbs.db
