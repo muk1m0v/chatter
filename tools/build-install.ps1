@@ -1,7 +1,7 @@
 param(
-    [string]$ProjectPath = (Join-Path $PSScriptRoot '..\diagnostics\android-smoke'),
+    [string]$ProjectPath = (Join-Path $PSScriptRoot '..\android'),
     [string]$DeviceSerial,
-    [string]$ApplicationId = 'local.codex.composecheck',
+    [string]$ApplicationId = 'com.mukimov.salom',
     [switch]$Offline
 )
 $ErrorActionPreference = 'Stop'

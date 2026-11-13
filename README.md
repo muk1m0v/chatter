@@ -1,6 +1,10 @@
-# Chatter
+# Салом / Salom
 
-Private repository for a native Android messenger. Preparation is complete; messenger features and backend have not been implemented yet.
+Native Android messenger prototype with a saturated yellow accent. The repository remains named `chatter`.
+
+## First test build — 0.1.0-test
+
+The `android` project contains the Salom app (`com.mukimov.salom`): phone/email entry with format validation, demo chat list and search, contacts, local message composition and persistence, profile editing, and a saved dark theme preference. Messages and profile data stay on the device. This is a local interface prototype: there is no SMS/email verification, backend authentication, remote message delivery, calls, or push notifications yet. The launcher icon is a native vector resource.
 
 ## Verified development baseline
 
@@ -9,7 +13,7 @@ Private repository for a native Android messenger. Preparation is complete; mess
 - Installation, launch, Compose rendering, button interaction, and relaunch verified on an itel C671L running Android 14.
 - A repeated offline build, USB installation, and launch completed in 59.3 seconds on the development PC. The unchanged build took 48 seconds; this is not a benchmark for future code changes.
 
-The `diagnostics/android-smoke` app is the verified preparation test, not a messenger implementation.
+The `diagnostics/android-smoke` app remains the original environment test. The build script now targets `android` by default.
 
 ## Build, install, and open on the connected phone
 
