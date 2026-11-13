@@ -152,10 +152,19 @@ internal fun PhoneContacts(context: Context) {
     selected?.let { contact ->
         AlertDialog(onDismissRequest = { selected = null }, title = { Text(contact.name) }, text = { Text(contact.number) }, confirmButton = {
             TextButton(onClick = {
+                val invitation = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, "Салом! 💛 Скачай приложение для Android: https://mukimov.site/")
+                }
+                context.startActivity(Intent.createChooser(invitation, "Пригласить в Салом"))
+                selected = null
+            }) { Text("Пригласить в Салом", color = MaterialTheme.colorScheme.onSurface) }
+        }, dismissButton = {
+            TextButton(onClick = {
                 val intent = Intent(Intent.ACTION_VIEW, ContentUris.withAppendedId(ContactsContract.Contacts.CONTENT_URI, contact.contactId))
                 runCatching { context.startActivity(intent) }
                 selected = null
             }) { Text("Открыть контакт", color = MaterialTheme.colorScheme.onSurface) }
-        }, dismissButton = { TextButton(onClick = { selected = null }) { Text("Закрыть", color = MaterialTheme.colorScheme.onSurface) } })
+        })
     }
 }

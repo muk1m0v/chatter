@@ -31,6 +31,9 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
@@ -47,7 +50,7 @@ private val Yellow = Color(0xFFFFC400)
 private val Ink = Color(0xFF25241F)
 private val Soft = Color(0xFFF5F5F3)
 private data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String)
-private data class Message(val text: String, val mine: Boolean)
+private data class Message(val text: String, val mine: Boolean, val time: String = "")
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
 class MainActivity : ComponentActivity() {
@@ -70,12 +73,12 @@ private class Store(context: Context) {
         if (raw.isEmpty()) return emptyList()
         return runCatching {
             val array = JSONArray(raw)
-            (0 until array.length()).map { val item = array.getJSONObject(it); Message(item.getString("text"), item.getBoolean("mine")) }.filter { it.mine }
+            (0 until array.length()).map { val item = array.getJSONObject(it); Message(item.getString("text"), item.getBoolean("mine"), item.optString("time", "")) }.filter { it.mine }
         }.getOrDefault(emptyList())
     }
     fun saveMessages(id: String, messages: List<Message>) {
         val array = JSONArray()
-        messages.forEach { array.put(JSONObject().put("text", it.text).put("mine", it.mine)) }
+        messages.forEach { array.put(JSONObject().put("text", it.text).put("mine", it.mine).put("time", it.time)) }
         save("messages_$id", array.toString())
     }
 }
@@ -194,10 +197,12 @@ private fun Chats(store: Store, onOpen: (Person) -> Unit, onNew: () -> Unit, onP
     Box(Modifier.fillMaxSize()) {
         Column {
             Header("Салом") { Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Box(Modifier.size(32.dp).clip(CircleShape).background(Yellow), contentAlignment = Alignment.Center) { Text(store.text("name", "С").take(1).uppercase(), fontSize = 14.sp, color = Ink, fontWeight = FontWeight.Bold) } } }
-            CompactSearch(search, { search = it }, "Поиск чатов")
+            CompactSearch(search, { search = it }, "Поиск и @username")
             Spacer(Modifier.height(6.dp))
             val preview = remember { store.messages("saved").lastOrNull()?.text ?: savedPerson.preview }
-            val visible = remember(search) { listOf(savedPerson).filter { it.name.contains(search, true) || preview.contains(search, true) } }
+            val username = store.text("username")
+            val selfMatch = search.startsWith("@") && username.isNotEmpty() && username.contains(search.removePrefix("@"), true)
+            val visible = remember(search) { if (search.startsWith("@")) emptyList() else listOf(savedPerson).filter { it.name.contains(search, true) || preview.contains(search, true) } }
             LazyColumn(contentPadding = PaddingValues(bottom = 90.dp)) {
                 items(visible, key = { it.id }, contentType = { "chat" }) { person ->
                     Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { onOpen(person) }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -212,7 +217,14 @@ private fun Chats(store: Store, onOpen: (Person) -> Unit, onNew: () -> Unit, onP
                         }
                     }
                 }
-                if (visible.isEmpty()) item { Text("Ничего не найдено", modifier = Modifier.fillMaxWidth().padding(32.dp), textAlign = TextAlign.Center) }
+                if (selfMatch) item {
+                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClick = onProfile).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Avatar(Person("me", store.text("name"), store.text("name").take(1).uppercase(), Yellow, ""), 42)
+                        Spacer(Modifier.width(12.dp))
+                        Column { Text(store.text("name"), fontWeight = FontWeight.SemiBold, fontSize = 15.sp); Text("@$username · Мой профиль", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    }
+                }
+                if (visible.isEmpty() && !selfMatch) item { Text(if (search.startsWith("@")) "Профиль не найден" else "Ничего не найдено", modifier = Modifier.fillMaxWidth().padding(32.dp), textAlign = TextAlign.Center) }
                 if (search.isEmpty()) item {
                     Column(Modifier.fillMaxWidth().padding(horizontal = 36.dp, vertical = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(Modifier.size(60.dp).clip(RoundedCornerShape(20.dp)).background(Yellow.copy(alpha = .18f)), contentAlignment = Alignment.Center) { NavIcon(0, MaterialTheme.colorScheme.onSurface, Modifier.size(27.dp)) }
@@ -233,9 +245,12 @@ private fun Conversation(person: Person, store: Store, onBack: () -> Unit) {
     var messages by remember(person.id) { mutableStateOf(store.messages(person.id)) }
     var draft by remember { mutableStateOf("") }
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
-    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex) }
-    Column(Modifier.fillMaxSize().imePadding()) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).background(MaterialTheme.colorScheme.surface).padding(horizontal = 4.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(0) }
+    val darkChat = MaterialTheme.colorScheme.background.red < .5f
+    val chatColors = if (darkChat) listOf(Color(0xFF22291D), Color(0xFF1B211A)) else listOf(Color(0xFFFFF6D5), Color(0xFFF4F8E9))
+    var emojiOpen by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().background(Brush.verticalGradient(chatColors)).imePadding()) {
+        Row(Modifier.padding(horizontal = 8.dp, vertical = 5.dp).fillMaxWidth().heightIn(min = 52.dp).clip(RoundedCornerShape(28.dp)).background(MaterialTheme.colorScheme.surface).padding(horizontal = 2.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onBack), contentAlignment = Alignment.Center) { Text("‹", fontSize = 30.sp, color = MaterialTheme.colorScheme.onSurface) }
             Avatar(person, 34); Spacer(Modifier.width(10.dp))
             Column { Text(person.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold); Text("Только для тебя", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -247,20 +262,31 @@ private fun Conversation(person: Person, store: Store, onBack: () -> Unit) {
                 Text("Всё важное — здесь", fontWeight = FontWeight.SemiBold, fontSize = 20.sp)
                 Text("Сохраняй мысли, планы и заметки", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
             }
-        } else LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(messages) { message ->
+        } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            items(messages.asReversed()) { message ->
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start) {
                     Column(Modifier.widthIn(max = 285.dp).clip(RoundedCornerShape(20.dp, 20.dp, if (message.mine) 5.dp else 20.dp, if (message.mine) 20.dp else 5.dp)).background(if (message.mine) Yellow else MaterialTheme.colorScheme.surface).padding(horizontal = 15.dp, vertical = 11.dp)) {
                         Text(message.text, color = if (message.mine) Ink else MaterialTheme.colorScheme.onSurface, fontSize = 16.sp)
-                        if (message.mine) Text("на устройстве", color = Ink.copy(alpha = .58f), fontSize = 9.sp, modifier = Modifier.align(Alignment.End).padding(top = 4.dp))
+                        if (message.time.isNotEmpty()) Text(message.time, color = Ink.copy(alpha = .58f), fontSize = 9.sp, modifier = Modifier.align(Alignment.End).padding(top = 2.dp))
                     }
                 }
             }
         }
-        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(10.dp), verticalAlignment = Alignment.Bottom) {
-            OutlinedTextField(draft, { draft = it.take(4000) }, placeholder = { Text("Сообщение") }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(24.dp), maxLines = 5)
+        if (emojiOpen) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+            listOf("💛", "😊", "👍", "👋", "✨").forEach { emoji ->
+                Box(Modifier.size(48.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surface).clickable { draft += emoji; emojiOpen = false }, contentAlignment = Alignment.Center) { Text(emoji, fontSize = 24.sp) }
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 5.dp), verticalAlignment = Alignment.Bottom) {
+            Row(Modifier.weight(1f).heightIn(min = 46.dp).clip(RoundedCornerShape(25.dp)).background(MaterialTheme.colorScheme.surface), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(46.dp).clickable { emojiOpen = !emojiOpen }, contentAlignment = Alignment.Center) { Text("☺", fontSize = 25.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                BasicTextField(draft, { draft = it.take(4000) }, modifier = Modifier.weight(1f).padding(end = 12.dp, top = 11.dp, bottom = 11.dp), textStyle = androidx.compose.ui.text.TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 15.sp, lineHeight = 21.sp), cursorBrush = SolidColor(Yellow), maxLines = 5, decorationBox = { inner ->
+                    if (draft.isEmpty()) Text("Сообщение", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
+                    inner()
+                })
+            }
             Spacer(Modifier.width(8.dp))
-            Button(onClick = { if (draft.isNotBlank()) { messages = messages + Message(draft.trim(), true); store.saveMessages(person.id, messages); draft = "" } }, enabled = draft.isNotBlank(), contentPadding = PaddingValues(0.dp), modifier = Modifier.padding(bottom = 3.dp).size(50.dp), shape = CircleShape) { Text("↑", fontSize = 27.sp) }
+            Button(onClick = { if (draft.isNotBlank()) { val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date()); messages = messages + Message(draft.trim(), true, time); store.saveMessages(person.id, messages); draft = ""; emojiOpen = false } }, enabled = draft.isNotBlank(), contentPadding = PaddingValues(0.dp), modifier = Modifier.size(46.dp), shape = CircleShape) { Text("↑", fontSize = 26.sp) }
         }
     }
 }
@@ -270,6 +296,7 @@ private fun Profile(store: Store, version: Int, onChanged: () -> Unit) {
     var edit by remember { mutableStateOf(false) }
     val name = remember(version) { store.text("name", "Твой профиль") }
     val about = remember(version) { store.text("about", "Салом! Я на связи 💛") }
+    val username = remember(version) { store.text("username") }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(16.dp))
         Avatar(Person("me", name, name.take(1).uppercase(), Yellow, ""), 76)
@@ -283,6 +310,7 @@ private fun Profile(store: Store, version: Int, onChanged: () -> Unit) {
             Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 if (store.text("phone").isNotEmpty()) Detail(store.text("phone"), "Телефон")
                 if (store.text("email").isNotEmpty()) Detail(store.text("email"), "Email")
+                if (username.isNotEmpty()) Detail("@$username", "Имя пользователя")
                 Detail(about, "О себе")
             }
         }
@@ -290,12 +318,15 @@ private fun Profile(store: Store, version: Int, onChanged: () -> Unit) {
         Text("Всё начинается с «Салом»", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
     if (edit) {
-        var newName by remember { mutableStateOf(name) }; var newAbout by remember { mutableStateOf(about) }
+        var newName by remember { mutableStateOf(name) }; var newAbout by remember { mutableStateOf(about) }; var newUsername by remember { mutableStateOf(username) }
+        val usernameValid = newUsername.isEmpty() || newUsername.matches(Regex("[a-zA-Z][a-zA-Z0-9_]{3,23}"))
         AlertDialog(onDismissRequest = { edit = false }, title = { Text("Твой профиль") }, text = { Column {
             OutlinedTextField(newName, { newName = it.take(40) }, label = { Text("Имя") }, singleLine = true)
             Spacer(Modifier.height(12.dp))
+            OutlinedTextField(newUsername, { newUsername = it.removePrefix("@").take(24) }, label = { Text("@username") }, singleLine = true, isError = !usernameValid, supportingText = { Text("4–24: латинские буквы, цифры и _") })
+            Spacer(Modifier.height(8.dp))
             OutlinedTextField(newAbout, { newAbout = it.take(160) }, label = { Text("О себе") }, maxLines = 3)
-        } }, confirmButton = { TextButton(onClick = { store.save("name", newName.trim()); store.save("about", newAbout.trim()); onChanged(); edit = false }, enabled = newName.isNotBlank()) { Text("Сохранить", color = MaterialTheme.colorScheme.onSurface) } }, dismissButton = { TextButton(onClick = { edit = false }) { Text("Отмена", color = MaterialTheme.colorScheme.onSurface) } })
+        } }, confirmButton = { TextButton(onClick = { store.save("name", newName.trim()); store.save("about", newAbout.trim()); store.save("username", newUsername); onChanged(); edit = false }, enabled = newName.isNotBlank() && usernameValid) { Text("Сохранить", color = MaterialTheme.colorScheme.onSurface) } }, dismissButton = { TextButton(onClick = { edit = false }) { Text("Отмена", color = MaterialTheme.colorScheme.onSurface) } })
     }
 }
 
@@ -313,7 +344,7 @@ private fun Settings(dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> U
                 HorizontalDivider(Modifier.padding(vertical = 18.dp))
                 Detail("На этом телефоне", "Хранение заметок")
                 Spacer(Modifier.height(20.dp))
-                Detail("0.2.1", "Версия Салом")
+                Detail("0.3.0", "Версия Салом")
             }
         }
         Spacer(Modifier.height(18.dp))
