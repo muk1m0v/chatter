@@ -12,6 +12,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -35,6 +37,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.json.JSONArray
@@ -104,9 +107,15 @@ private fun SalomApp(context: Context) {
                 Conversation(activeChat!!, store) { activeChat = null }
             } else {
                 Scaffold(containerColor = scheme.background, bottomBar = {
-                    NavigationBar(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp).clip(RoundedCornerShape(28.dp)), containerColor = scheme.surface, tonalElevation = 0.dp) {
+                    Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp).fillMaxWidth().clip(RoundedCornerShape(28.dp)).background(scheme.surface).selectableGroup(), verticalAlignment = Alignment.CenterVertically) {
                         listOf("Чаты", "Контакты", "Настройки", "Профиль").forEachIndexed { index, title ->
-                            NavigationBarItem(selected = tab == index, onClick = { tab = index }, icon = { NavIcon(index, if (tab == index) Ink else scheme.onSurfaceVariant) }, label = { Text(title, fontSize = 11.sp, maxLines = 1) }, colors = NavigationBarItemDefaults.colors(indicatorColor = Yellow, selectedTextColor = scheme.onSurface))
+                            Column(Modifier.weight(1f).heightIn(min = 56.dp).selectable(selected = tab == index, role = Role.Tab, onClick = { tab = index }).padding(vertical = 5.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                                Box(Modifier.size(width = 42.dp, height = 27.dp).clip(RoundedCornerShape(16.dp)).background(if (tab == index) Yellow else Color.Transparent), contentAlignment = Alignment.Center) {
+                                    NavIcon(index, if (tab == index) Ink else scheme.onSurfaceVariant, Modifier.size(22.dp))
+                                }
+                                Spacer(Modifier.height(2.dp))
+                                Text(title, fontSize = 10.sp, lineHeight = 12.sp, maxLines = 1, color = if (tab == index) scheme.onSurface else scheme.onSurfaceVariant)
+                            }
                         }
                     }
                 }) { padding ->
@@ -165,17 +174,17 @@ private fun Welcome(store: Store, onEnter: () -> Unit) {
 
 @Composable
 private fun Header(title: String, subtitle: String? = null, trailing: @Composable (() -> Unit)? = null) {
-    Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(horizontal = 16.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text(title, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-            if (subtitle != null) Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
+            Text(title, fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold)
+            if (subtitle != null) Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, lineHeight = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         trailing?.invoke()
     }
 }
 
 @Composable
-private fun Avatar(person: Person, size: Int = 54) {
+private fun Avatar(person: Person, size: Int = 46) {
     Box(Modifier.size(size.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) { Text(person.initials, color = Ink, fontSize = (size * .37).sp, fontWeight = FontWeight.SemiBold) }
 }
 
@@ -184,38 +193,38 @@ private fun Chats(store: Store, onOpen: (Person) -> Unit, onNew: () -> Unit, onP
     var search by remember { mutableStateOf("") }
     Box(Modifier.fillMaxSize()) {
         Column {
-            Header("Салом") { Box(Modifier.size(40.dp).clip(CircleShape).background(Yellow).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Text(store.text("name", "С").take(1).uppercase(), color = Ink, fontWeight = FontWeight.Bold) } }
-            OutlinedTextField(search, { search = it }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp), placeholder = { Text("Поиск чатов") }, leadingIcon = { Text("⌕", fontSize = 26.sp) }, singleLine = true, shape = RoundedCornerShape(24.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Yellow, unfocusedContainerColor = MaterialTheme.colorScheme.surface))
-            Spacer(Modifier.height(12.dp))
+            Header("Салом") { Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Box(Modifier.size(32.dp).clip(CircleShape).background(Yellow), contentAlignment = Alignment.Center) { Text(store.text("name", "С").take(1).uppercase(), fontSize = 14.sp, color = Ink, fontWeight = FontWeight.Bold) } } }
+            CompactSearch(search, { search = it }, "Поиск чатов")
+            Spacer(Modifier.height(6.dp))
             val preview = remember { store.messages("saved").lastOrNull()?.text ?: savedPerson.preview }
             val visible = remember(search) { listOf(savedPerson).filter { it.name.contains(search, true) || preview.contains(search, true) } }
             LazyColumn(contentPadding = PaddingValues(bottom = 90.dp)) {
                 items(visible, key = { it.id }, contentType = { "chat" }) { person ->
-                    Row(Modifier.fillMaxWidth().clickable { onOpen(person) }.padding(horizontal = 18.dp, vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { onOpen(person) }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(person)
-                        Spacer(Modifier.width(13.dp))
+                        Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(person.name, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(person.name, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, lineHeight = 19.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
-                            Spacer(Modifier.height(6.dp))
+                            Spacer(Modifier.height(3.dp))
                             Text(preview, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
                 if (visible.isEmpty()) item { Text("Ничего не найдено", modifier = Modifier.fillMaxWidth().padding(32.dp), textAlign = TextAlign.Center) }
                 if (search.isEmpty()) item {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 40.dp, vertical = 54.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Box(Modifier.size(76.dp).clip(RoundedCornerShape(26.dp)).background(Yellow.copy(alpha = .18f)), contentAlignment = Alignment.Center) { NavIcon(0, MaterialTheme.colorScheme.onSurface, Modifier.size(32.dp)) }
-                        Spacer(Modifier.height(20.dp))
-                        Text("Начни с «Салом»", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Твои близкие уже есть в телефонной книге", fontSize = 14.sp, lineHeight = 21.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 10.dp, bottom = 18.dp))
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 36.dp, vertical = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Box(Modifier.size(60.dp).clip(RoundedCornerShape(20.dp)).background(Yellow.copy(alpha = .18f)), contentAlignment = Alignment.Center) { NavIcon(0, MaterialTheme.colorScheme.onSurface, Modifier.size(27.dp)) }
+                        Spacer(Modifier.height(16.dp))
+                        Text("Начни с «Салом»", fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Твои близкие уже есть в телефонной книге", fontSize = 13.sp, lineHeight = 19.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 8.dp, bottom = 10.dp))
                         TextButton(onClick = onNew) { Text("Открыть контакты", color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold) }
                     }
                 }
             }
         }
-        FloatingActionButton(onClick = onNew, containerColor = Yellow, contentColor = Ink, shape = RoundedCornerShape(22.dp), modifier = Modifier.align(Alignment.BottomEnd).padding(22.dp)) { Text("+", fontSize = 32.sp) }
+        FloatingActionButton(onClick = onNew, containerColor = Yellow, contentColor = Ink, shape = RoundedCornerShape(18.dp), modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).size(48.dp)) { Text("+", fontSize = 28.sp) }
     }
 }
 
@@ -226,10 +235,10 @@ private fun Conversation(person: Person, store: Store, onBack: () -> Unit) {
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
     LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex) }
     Column(Modifier.fillMaxSize().imePadding()) {
-        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("‹", fontSize = 34.sp, color = MaterialTheme.colorScheme.onSurface) }
-            Avatar(person, 42); Spacer(Modifier.width(12.dp))
-            Column { Text(person.name, fontWeight = FontWeight.Bold); Text("Только для тебя", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).background(MaterialTheme.colorScheme.surface).padding(horizontal = 4.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onBack), contentAlignment = Alignment.Center) { Text("‹", fontSize = 30.sp, color = MaterialTheme.colorScheme.onSurface) }
+            Avatar(person, 34); Spacer(Modifier.width(10.dp))
+            Column { Text(person.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold); Text("Только для тебя", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
         if (messages.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
@@ -261,24 +270,24 @@ private fun Profile(store: Store, version: Int, onChanged: () -> Unit) {
     var edit by remember { mutableStateOf(false) }
     val name = remember(version) { store.text("name", "Твой профиль") }
     val about = remember(version) { store.text("about", "Салом! Я на связи 💛") }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(25.dp))
-        Avatar(Person("me", name, name.take(1).uppercase(), Yellow, ""), 94)
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(16.dp))
-        Text(name, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-        Text("Мой профиль", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(20.dp))
-        Button(onClick = { edit = true }, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth().height(49.dp)) { Text("Редактировать профиль", fontWeight = FontWeight.SemiBold) }
-        Spacer(Modifier.height(18.dp))
-        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        Avatar(Person("me", name, name.take(1).uppercase(), Yellow, ""), 76)
+        Spacer(Modifier.height(12.dp))
+        Text(name, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+        Text("Мой профиль", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(12.dp))
+        Button(onClick = { edit = true }, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("Редактировать профиль", fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+        Spacer(Modifier.height(12.dp))
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(18.dp)) {
+            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 if (store.text("phone").isNotEmpty()) Detail(store.text("phone"), "Телефон")
                 if (store.text("email").isNotEmpty()) Detail(store.text("email"), "Email")
                 Detail(about, "О себе")
             }
         }
-        Spacer(Modifier.height(24.dp))
-        Text("Всё начинается с «Салом»", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(18.dp))
+        Text("Всё начинается с «Салом»", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
     if (edit) {
         var newName by remember { mutableStateOf(name) }; var newAbout by remember { mutableStateOf(about) }
@@ -291,20 +300,20 @@ private fun Profile(store: Store, version: Int, onChanged: () -> Unit) {
 }
 
 @Composable
-private fun Detail(value: String, label: String) { Column { Text(value, fontSize = 16.sp); Text(label, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp)) } }
+private fun Detail(value: String, label: String) { Column { Text(value, fontSize = 14.sp); Text(label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp)) } }
 
 @Composable
 private fun Settings(dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> Unit) {
     var confirmLogout by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
         Header("Настройки", "Сделай Салом своим")
-        Card(Modifier.padding(horizontal = 18.dp), shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-            Column(Modifier.padding(20.dp)) {
+        Card(Modifier.padding(horizontal = 14.dp), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+            Column(Modifier.padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Тёмная тема", fontWeight = FontWeight.Medium); Text("Для вечерних разговоров", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Switch(checked = dark, onCheckedChange = onDark, colors = SwitchDefaults.colors(checkedTrackColor = Yellow, checkedThumbColor = Ink)) }
                 HorizontalDivider(Modifier.padding(vertical = 18.dp))
                 Detail("На этом телефоне", "Хранение заметок")
                 Spacer(Modifier.height(20.dp))
-                Detail("0.2.0", "Версия Салом")
+                Detail("0.2.1", "Версия Салом")
             }
         }
         Spacer(Modifier.height(18.dp))

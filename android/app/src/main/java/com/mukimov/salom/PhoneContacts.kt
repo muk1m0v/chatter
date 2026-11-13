@@ -105,10 +105,10 @@ internal fun PhoneContacts(context: Context) {
     }
     val palette = remember { listOf(Color(0xFFFFE9A6), Color(0xFFDFEBDD), Color(0xFFEADFF4), Color(0xFFDDEAF6), Color(0xFFFFE4D2)) }
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("Контакты", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                Text(if (granted) "На телефоне · ${contacts.size}" else "Твои близкие — рядом", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Контакты", fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold)
+                Text(if (granted) "На телефоне · ${contacts.size}" else "Твои близкие — рядом", fontSize = 11.sp, lineHeight = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (granted) TextButton(onClick = { refresh++ }, enabled = !loading) { Text("Обновить", color = MaterialTheme.colorScheme.onSurface, fontSize = 12.sp) }
         }
@@ -124,15 +124,15 @@ internal fun PhoneContacts(context: Context) {
                 }
             }
         } else {
-            OutlinedTextField(search, { search = it }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp), placeholder = { Text("Имя или номер") }, singleLine = true, shape = RoundedCornerShape(24.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = accent, unfocusedContainerColor = MaterialTheme.colorScheme.surface))
+            CompactSearch(search, { search = it }, "Имя или номер")
             if (loading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp), color = accent)
             if (error) {
                 Text("Не удалось прочитать контакты", modifier = Modifier.padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = { refresh++ }) { Text("Попробовать ещё", color = MaterialTheme.colorScheme.onSurface) }
-            } else LazyColumn(state = listState, modifier = Modifier.weight(1f), contentPadding = PaddingValues(top = 12.dp, bottom = 16.dp)) {
+            } else LazyColumn(state = listState, modifier = Modifier.weight(1f), contentPadding = PaddingValues(top = 6.dp, bottom = 12.dp)) {
                 items(visible, key = { it.key }, contentType = { "contact" }) { contact ->
-                    Row(Modifier.fillMaxWidth().clickable { selected = contact }.padding(horizontal = 20.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(50.dp).clip(CircleShape).background(palette[contact.colorIndex]), contentAlignment = Alignment.Center) { Text(contact.initials, fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFF25241F)) }
+                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { selected = contact }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(44.dp).clip(CircleShape).background(palette[contact.colorIndex]), contentAlignment = Alignment.Center) { Text(contact.initials, fontSize = 17.sp, fontWeight = FontWeight.Medium, color = Color(0xFF25241F)) }
                         Spacer(Modifier.width(14.dp))
                         Column(Modifier.weight(1f)) {
                             Text(contact.name, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
