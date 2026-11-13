@@ -2,7 +2,8 @@ param(
     [string]$ProjectPath = (Join-Path $PSScriptRoot '..\android'),
     [string]$DeviceSerial,
     [string]$ApplicationId = 'com.mukimov.salom',
-    [switch]$Offline
+    [switch]$Offline,
+    [ValidateSet('debug', 'release')][string]$Variant = 'release'
 )
 $ErrorActionPreference = 'Stop'
 $ProjectPath = (Resolve-Path -LiteralPath $ProjectPath).Path
@@ -26,12 +27,13 @@ if (-not (Test-Path -LiteralPath $gradlePath)) {
     if (-not $cachedGradle.Count) { throw 'Gradle Wrapper or cached Gradle 8.13 is required.' }
     $gradlePath = $cachedGradle[0].FullName
 }
-$buildArgs = @('-p', $ProjectPath, '--no-daemon', '--console=plain', 'assembleDebug')
+$buildTask = if ($Variant -eq 'release') { 'assembleRelease' } else { 'assembleDebug' }
+$buildArgs = @('-p', $ProjectPath, '--no-daemon', '--console=plain', $buildTask)
 if ($Offline) { $buildArgs += '--offline' }
 $timer = [Diagnostics.Stopwatch]::StartNew()
 & $gradlePath @buildArgs
 if ($LASTEXITCODE -ne 0) { throw 'Build failed. No APK was installed.' }
-$apkPath = Join-Path $ProjectPath 'app\build\outputs\apk\debug\app-debug.apk'
+$apkPath = Join-Path $ProjectPath "app\build\outputs\apk\$Variant\app-$Variant.apk"
 if (-not (Test-Path -LiteralPath $apkPath)) { throw "APK not found: $apkPath" }
 & $adbPath -s $DeviceSerial install -r $apkPath
 if ($LASTEXITCODE -ne 0) { throw 'APK installation failed.' }

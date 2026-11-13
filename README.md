@@ -2,9 +2,11 @@
 
 Native Android messenger prototype with a saturated yellow accent. The repository remains named `chatter`.
 
-## First test build — 0.1.0-test
+## Current version — 0.2.0
 
-The `android` project contains the Salom app (`com.mukimov.salom`): phone/email entry with format validation, demo chat list and search, contacts, local message composition and persistence, profile editing, and a saved dark theme preference. Messages and profile data stay on the device. This is a local interface prototype: there is no SMS/email verification, backend authentication, remote message delivery, calls, or push notifications yet. The launcher icon is a native vector resource.
+The `android` project contains Salom (`com.mukimov.salom`): phone/email profile entry, real device contacts with runtime permission and background loading, private Saved Messages, profile editing, and light/dark themes. Fictional contacts and demo labels were removed in 0.2.0. The default build is an R8-optimized release. See [the 0.2 notes](docs/salom-v0.2.md).
+
+Data stays on the device. SMS/email verification, backend authentication, remote message delivery, calls, and push notifications have not been implemented. Device contacts are not presented as registered Salom users.
 
 ## Verified development baseline
 
