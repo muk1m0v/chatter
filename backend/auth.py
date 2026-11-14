@@ -172,4 +172,3 @@ def install_routes(app, connect, current_profile, public, digest):
             db.execute('DELETE FROM sessions WHERE token_hash=?', (digest(authorization),))
             db.execute('DELETE FROM push_tokens WHERE profile_id=?', (profile['id'],))
         return {'signed_out': True}
-

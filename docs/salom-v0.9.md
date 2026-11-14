@@ -35,4 +35,4 @@ Text messages still use HTTPS and server storage; end-to-end encryption and call
 - Signed APK installed over the existing Itel C671L application and launched successfully; existing conversations remained visible. Google linking screen and its button were inspected on the phone. Google provider enabled and Android signing SHA-1 matching the downloaded OAuth config were verified.
 - VersionCode 11; APK 2,849,424 bytes; SHA-256 `d1f39c1967eb9a00386304703a26954a88c72f957409e75fa13e3bba73608745`.
 - Published immutable APK: https://mukimov.site/salom/salom-0.9.0.apk. Metadata and the downloaded public APK agree on size and SHA-256.
-- User Google account selection/consent is the remaining end-to-end check at the time of this entry.
+- Real Google sign-in on Itel completed successfully. The user confirmed entry; the production database confirms Google linked to @muk1mov, an active session and retained existing messages. Installed version 0.9.0/code 11 was verified; no Salom crash appeared in the recent crash buffer.

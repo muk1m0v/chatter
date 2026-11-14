@@ -170,6 +170,3 @@ class AuthTests(unittest.TestCase):
             self.assertIsNone(db.execute('SELECT 1 FROM sessions WHERE token_hash=?', (account['session_token'],)).fetchone())
 
 if __name__ == '__main__': unittest.main()
-
-
-
