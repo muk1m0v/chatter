@@ -38,9 +38,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 
 @Immutable
-private data class PhoneContact(val key: String, val contactId: Long, val name: String, val number: String, val initials: String, val colorIndex: Int)
+internal data class PhoneContact(val key: String, val contactId: Long, val name: String, val number: String, val initials: String, val colorIndex: Int)
 
-private fun readContacts(context: Context): List<PhoneContact> {
+internal fun readContacts(context: Context): List<PhoneContact> {
     val phone = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
     val columns = arrayOf(ContactsContract.CommonDataKinds.Phone.CONTACT_ID, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY, ContactsContract.CommonDataKinds.Phone.NUMBER)
     val contacts = LinkedHashMap<String, PhoneContact>()
@@ -60,7 +60,7 @@ private fun readContacts(context: Context): List<PhoneContact> {
 }
 
 @Composable
-internal fun PhoneContacts(context: Context) {
+internal fun PhoneContacts(context: Context, accounts: List<SalomAccount> = emptyList(), onOpenAccount: (SalomAccount) -> Unit = {}) {
     val accent = Color(0xFFFFC400)
     var granted by remember { mutableStateOf(context.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) }
     var asked by rememberSaveable { mutableStateOf(false) }
@@ -98,10 +98,11 @@ internal fun PhoneContacts(context: Context) {
             error = true
         } finally { loading = false }
     }
-    val visible = remember(search, contacts) {
-        val query = search.trim()
-        val digits = query.filter { it.isDigit() }
-        if (query.isEmpty()) contacts else contacts.filter { it.name.contains(query, true) || (digits.isNotEmpty() && it.number.filter { c -> c.isDigit() }.contains(digits)) }
+    val visible = remember(search, contacts, accounts) {
+        if (search.isBlank()) contacts else contacts.mapNotNull { contact ->
+            val account = accounts.firstOrNull { canonicalPhone(it.phone) == canonicalPhone(contact.number) }
+            smartSearchScore(search, contact.name, account?.username.orEmpty(), contact.number)?.let { contact to it }
+        }.sortedBy { it.second }.map { it.first }
     }
     val palette = remember { listOf(Color(0xFFFFE9A6), Color(0xFFDFEBDD), Color(0xFFEADFF4), Color(0xFFDDEAF6), Color(0xFFFFE4D2)) }
     Column(Modifier.fillMaxSize()) {
@@ -124,14 +125,17 @@ internal fun PhoneContacts(context: Context) {
                 }
             }
         } else {
-            CompactSearch(search, { search = it }, "Имя или номер")
+            CompactSearch(search, { search = it }, "Имя, username или номер")
             if (loading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp), color = accent)
             if (error) {
                 Text("Не удалось прочитать контакты", modifier = Modifier.padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = { refresh++ }) { Text("Попробовать ещё", color = MaterialTheme.colorScheme.onSurface) }
             } else LazyColumn(state = listState, modifier = Modifier.weight(1f), contentPadding = PaddingValues(top = 6.dp, bottom = 12.dp)) {
                 items(visible, key = { it.key }, contentType = { "contact" }) { contact ->
-                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { selected = contact }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable {
+                        val account = accounts.firstOrNull { it.phone.isNotBlank() && canonicalPhone(it.phone) == canonicalPhone(contact.number) }
+                        if (contactDestination(account) == ContactDestination.CHAT) onOpenAccount(account!!) else selected = contact
+                    }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.size(44.dp).clip(CircleShape).background(palette[contact.colorIndex]), contentAlignment = Alignment.Center) { Text(contact.initials, fontSize = 17.sp, fontWeight = FontWeight.Medium, color = Color(0xFF25241F)) }
                         Spacer(Modifier.width(14.dp))
                         Column(Modifier.weight(1f)) {
@@ -149,22 +153,28 @@ internal fun PhoneContacts(context: Context) {
             }
         }
     }
-    selected?.let { contact ->
-        AlertDialog(onDismissRequest = { selected = null }, title = { Text(contact.name) }, text = { Text(contact.number) }, confirmButton = {
+    selected?.let { contact -> ContactActions(context, contact, accounts.firstOrNull { it.phone.isNotBlank() && canonicalPhone(it.phone) == canonicalPhone(contact.number) }) { selected = null } }
+}
+
+@Composable
+internal fun ContactActions(context: Context, contact: PhoneContact, account: SalomAccount?, onDismiss: () -> Unit) {
+        AlertDialog(onDismissRequest = onDismiss, title = { Text(contact.name) }, text = { Column {
+            Text(contact.number)
+            if (contactDestination(account) == ContactDestination.UNKNOWN) Text("Статус аккаунта ещё не подтверждён", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
+        } }, confirmButton = {
             TextButton(onClick = {
                 val invitation = Intent(Intent.ACTION_SEND).apply {
                     type = "text/plain"
                     putExtra(Intent.EXTRA_TEXT, "Салом! 💛 Скачай приложение для Android: https://mukimov.site/")
                 }
                 context.startActivity(Intent.createChooser(invitation, "Пригласить в Салом"))
-                selected = null
+                onDismiss()
             }) { Text("Пригласить в Салом", color = MaterialTheme.colorScheme.onSurface) }
         }, dismissButton = {
             TextButton(onClick = {
                 val intent = Intent(Intent.ACTION_VIEW, ContentUris.withAppendedId(ContactsContract.Contacts.CONTENT_URI, contact.contactId))
                 runCatching { context.startActivity(intent) }
-                selected = null
+                onDismiss()
             }) { Text("Открыть контакт", color = MaterialTheme.colorScheme.onSurface) }
         })
-    }
 }

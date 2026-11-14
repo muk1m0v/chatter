@@ -9,7 +9,7 @@ import shutil
 import subprocess
 
 incoming = Path('/tmp/salom-deploy')
-apk = incoming / 'salom-0.3.0.apk'
+apk = incoming / 'salom-0.3.1.apk'
 assert apk.is_file() and apk.stat().st_size > 100_000
 assert (incoming / 'index.html').is_file()
 config = Path('/etc/nginx/sites-available/ryadom')
@@ -23,19 +23,25 @@ target = Path('/var/www/salom')
 target.mkdir(parents=True, exist_ok=True)
 shutil.copy2(apk, target / apk.name)
 shutil.copy2(apk, target / 'salom-latest.apk')
-metadata = {'version': '0.3.0', 'versionCode': 4, 'minSdk': 23, 'downloadUrl': 'https://mukimov.site/salom/salom-latest.apk', 'size': apk.stat().st_size, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest()}
+metadata = {'version': '0.3.1', 'versionCode': 5, 'minSdk': 23, 'downloadUrl': 'https://mukimov.site/salom/salom-latest.apk', 'size': apk.stat().st_size, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest()}
 (target / 'version.json').write_text(json.dumps(metadata, indent=2) + '\n')
 for file in target.iterdir():
     if file.is_file(): file.chmod(0o644)
 new_config = config.read_text()
 marker = '    # Salom downloads\n'
+anchor = '    location /static/ {'
+if marker in new_config:
+    start = new_config.index(marker)
+    end = new_config.index(anchor, start)
+    new_config = new_config[:start] + new_config[end:]
 if marker not in new_config:
     routes = marker
-    for filename in ('salom-0.3.0.apk', 'salom-latest.apk'):
+    for filename in sorted(file.name for file in target.glob('salom-*.apk')):
+        download_name = 'salom-0.3.1.apk' if filename == 'salom-latest.apk' else filename
         routes += f'''    location = /salom/{filename} {{
         alias /var/www/salom/{filename};
         default_type application/vnd.android.package-archive;
-        add_header Content-Disposition 'attachment; filename="salom-0.3.0.apk"';
+        add_header Content-Disposition 'attachment; filename="{download_name}"';
         add_header Cache-Control 'no-store';
         add_header X-Content-Type-Options nosniff always;
     }}

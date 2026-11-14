@@ -49,7 +49,7 @@ import org.json.JSONObject
 private val Yellow = Color(0xFFFFC400)
 private val Ink = Color(0xFF25241F)
 private val Soft = Color(0xFFF5F5F3)
-private data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String)
+private data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "")
 private data class Message(val text: String, val mine: Boolean, val time: String = "")
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
@@ -91,6 +91,8 @@ private fun SalomApp(context: Context) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var activeChat by remember { mutableStateOf<Person?>(null) }
     var profileVersion by remember { mutableIntStateOf(0) }
+    val accounts = remember(profileVersion, signedIn) { listOf(SalomAccount("self", store.text("name"), store.text("username"), store.text("phone"), is_active = signedIn)) }
+    val openAccount: (SalomAccount) -> Unit = { account -> activeChat = if (account.id == "self") savedPerson else Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username) }
     val scheme = if (dark) darkColorScheme(primary = Yellow, onPrimary = Ink, background = Color(0xFF171816), surface = Color(0xFF232420), secondaryContainer = Color(0xFF494125))
     else lightColorScheme(primary = Yellow, onPrimary = Ink, background = Soft, surface = Color.White, onSurface = Ink, secondaryContainer = Color(0xFFFFF0B2))
     SideEffect {
@@ -124,8 +126,8 @@ private fun SalomApp(context: Context) {
                 }) { padding ->
                     Crossfade(targetState = tab, animationSpec = tween(140), modifier = Modifier.padding(padding), label = "navigation") { page ->
                         when (page) {
-                            0 -> Chats(store, { activeChat = it }, { tab = 1 }, { tab = 3 })
-                            1 -> PhoneContacts(context)
+                            0 -> Chats(context, store, accounts, openAccount, { activeChat = it }, { tab = 1 }, { tab = 3 })
+                            1 -> PhoneContacts(context, accounts, openAccount)
                             2 -> Settings(dark, { dark = it; store.save("dark", if (it) "yes" else "no") }, { store.save("signed_in", "no"); signedIn = false; tab = 0 })
                             else -> Profile(store, profileVersion) { profileVersion++ }
                         }
@@ -192,18 +194,17 @@ private fun Avatar(person: Person, size: Int = 46) {
 }
 
 @Composable
-private fun Chats(store: Store, onOpen: (Person) -> Unit, onNew: () -> Unit, onProfile: () -> Unit) {
+private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, onOpenAccount: (SalomAccount) -> Unit, onOpen: (Person) -> Unit, onNew: () -> Unit, onProfile: () -> Unit) {
     var search by remember { mutableStateOf("") }
     Box(Modifier.fillMaxSize()) {
         Column {
             Header("Салом") { Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Box(Modifier.size(32.dp).clip(CircleShape).background(Yellow), contentAlignment = Alignment.Center) { Text(store.text("name", "С").take(1).uppercase(), fontSize = 14.sp, color = Ink, fontWeight = FontWeight.Bold) } } }
-            CompactSearch(search, { search = it }, "Поиск и @username")
+            CompactSearch(search, { search = it }, "Имя, username или номер")
             Spacer(Modifier.height(6.dp))
             val preview = remember { store.messages("saved").lastOrNull()?.text ?: savedPerson.preview }
-            val username = store.text("username")
-            val selfMatch = search.startsWith("@") && username.isNotEmpty() && username.contains(search.removePrefix("@"), true)
-            val visible = remember(search) { if (search.startsWith("@")) emptyList() else listOf(savedPerson).filter { it.name.contains(search, true) || preview.contains(search, true) } }
-            LazyColumn(contentPadding = PaddingValues(bottom = 90.dp)) {
+            val visible = listOf(savedPerson)
+            if (search.isNotBlank()) SmartPeopleResults(context, search, accounts, onOpenAccount, onProfile)
+            else LazyColumn(contentPadding = PaddingValues(bottom = 90.dp)) {
                 items(visible, key = { it.id }, contentType = { "chat" }) { person ->
                     Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { onOpen(person) }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(person)
@@ -217,14 +218,6 @@ private fun Chats(store: Store, onOpen: (Person) -> Unit, onNew: () -> Unit, onP
                         }
                     }
                 }
-                if (selfMatch) item {
-                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(onClick = onProfile).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(Person("me", store.text("name"), store.text("name").take(1).uppercase(), Yellow, ""), 42)
-                        Spacer(Modifier.width(12.dp))
-                        Column { Text(store.text("name"), fontWeight = FontWeight.SemiBold, fontSize = 15.sp); Text("@$username · Мой профиль", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    }
-                }
-                if (visible.isEmpty() && !selfMatch) item { Text(if (search.startsWith("@")) "Профиль не найден" else "Ничего не найдено", modifier = Modifier.fillMaxWidth().padding(32.dp), textAlign = TextAlign.Center) }
                 if (search.isEmpty()) item {
                     Column(Modifier.fillMaxWidth().padding(horizontal = 36.dp, vertical = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(Modifier.size(60.dp).clip(RoundedCornerShape(20.dp)).background(Yellow.copy(alpha = .18f)), contentAlignment = Alignment.Center) { NavIcon(0, MaterialTheme.colorScheme.onSurface, Modifier.size(27.dp)) }
@@ -253,7 +246,7 @@ private fun Conversation(person: Person, store: Store, onBack: () -> Unit) {
         Row(Modifier.padding(horizontal = 8.dp, vertical = 5.dp).fillMaxWidth().heightIn(min = 52.dp).clip(RoundedCornerShape(28.dp)).background(MaterialTheme.colorScheme.surface).padding(horizontal = 2.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onBack), contentAlignment = Alignment.Center) { Text("‹", fontSize = 30.sp, color = MaterialTheme.colorScheme.onSurface) }
             Avatar(person, 34); Spacer(Modifier.width(10.dp))
-            Column { Text(person.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold); Text("Только для тебя", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            Column { Text(person.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold); Text(if (person.id == "saved") "Только для тебя" else "@${person.username}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
         if (messages.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
@@ -262,7 +255,7 @@ private fun Conversation(person: Person, store: Store, onBack: () -> Unit) {
                 Text("Всё важное — здесь", fontWeight = FontWeight.SemiBold, fontSize = 20.sp)
                 Text("Сохраняй мысли, планы и заметки", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
             }
-        } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom)) {
             items(messages.asReversed()) { message ->
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start) {
                     Column(Modifier.widthIn(max = 285.dp).clip(RoundedCornerShape(20.dp, 20.dp, if (message.mine) 5.dp else 20.dp, if (message.mine) 20.dp else 5.dp)).background(if (message.mine) Yellow else MaterialTheme.colorScheme.surface).padding(horizontal = 15.dp, vertical = 11.dp)) {
@@ -344,7 +337,7 @@ private fun Settings(dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> U
                 HorizontalDivider(Modifier.padding(vertical = 18.dp))
                 Detail("На этом телефоне", "Хранение заметок")
                 Spacer(Modifier.height(20.dp))
-                Detail("0.3.0", "Версия Салом")
+                Detail("0.3.1", "Версия Салом")
             }
         }
         Spacer(Modifier.height(18.dp))
