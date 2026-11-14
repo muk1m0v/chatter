@@ -53,7 +53,8 @@ class PushTests(unittest.TestCase):
         self.assertTrue(self.dispatcher.deliver_one())
         sent = self.dispatcher.session.sent[0]['message']
         self.assertEqual(sent['data'], {'peer_id': self.ids[0], 'message_id': str(result['id'])})
-        self.assertEqual(sent['android']['notification']['channel_id'], 'salom_messages')
+        self.assertEqual(sent['android']['notification']['channel_id'], 'salom_messages_ding_v1')
+        self.assertEqual(sent['android']['notification']['sound'], 'salom_ding')
         with app.connect() as db: self.assertEqual(db.execute('SELECT state FROM push_jobs').fetchone()[0], 'sent')
 
     def test_network_failure_retries_without_losing_message(self):

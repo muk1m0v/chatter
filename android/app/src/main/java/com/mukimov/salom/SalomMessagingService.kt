@@ -20,13 +20,28 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 
 internal object PushNotifications {
-    const val CHANNEL = "salom_messages"
+    const val CHANNEL = "salom_messages_ding_v1"
+    private const val LEGACY_CHANNEL = "salom_messages"
+    fun soundUri(context: Context): android.net.Uri = android.net.Uri.parse(
+        "android.resource://${context.packageName}/raw/${context.resources.getResourceEntryName(R.raw.salom_ding)}")
     fun createChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= 26) {
-            context.getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL, "Сообщения", NotificationManager.IMPORTANCE_HIGH).apply {
-                    description = "Новые сообщения в Салом"
+            val manager = context.getSystemService(NotificationManager::class.java)
+            if (manager.getNotificationChannel(CHANNEL) != null) return
+            val previous = manager.getNotificationChannel(LEGACY_CHANNEL)
+            val sound = when {
+                previous != null && previous.sound == null -> null
+                Build.VERSION.SDK_INT >= 30 && previous?.hasUserSetSound() == true -> previous.sound
+                else -> soundUri(context)
+            }
+            manager.createNotificationChannel(
+                NotificationChannel(CHANNEL, "Сообщения Салом", previous?.importance ?: NotificationManager.IMPORTANCE_HIGH).apply {
+                    description = "Новые сообщения · звук Салом"
                     lockscreenVisibility = android.app.Notification.VISIBILITY_PRIVATE
+                    setSound(sound, android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                    previous?.let { vibrationPattern = it.vibrationPattern; enableVibration(it.shouldVibrate()) }
                 }
             )
         }
@@ -83,6 +98,7 @@ class SalomMessagingService : FirebaseMessagingService() {
             .setSmallIcon(R.drawable.ic_notification).setColor(0xFFFFC400.toInt())
             .setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setContentIntent(pending).setAutoCancel(true).setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setSound(PushNotifications.soundUri(this))
             .setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).build()
         try { NotificationManagerCompat.from(this).notify("salom-$messageId", 0, notification) }
         catch (_: SecurityException) { /* Permission can be revoked between checking and posting. */ }
