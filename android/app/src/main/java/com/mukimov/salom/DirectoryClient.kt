@@ -15,7 +15,7 @@ import java.util.UUID
 
 internal class DirectoryException(message: String, val status: Int = 0) : Exception(message)
 internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
-internal data class MessageBatch(val messages: List<Message>, val hasMore: Boolean)
+internal data class MessageBatch(val messages: List<Message>, val hasMore: Boolean, val clearedThrough: Long)
 
 /** Private installation/session credential for the Salom API. Google sign-in uses AuthClient. */
 internal class DirectoryClient(context: Context) {
@@ -49,8 +49,8 @@ internal class DirectoryClient(context: Context) {
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("Authorization", "Bearer $token")
             connection.setRequestProperty("Accept", "application/json")
+            connection.requestMethod = method
             if (body != null) {
-                connection.requestMethod = method
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 val data = body.toString().toByteArray(Charsets.UTF_8)
@@ -100,16 +100,16 @@ internal class DirectoryClient(context: Context) {
 
     private fun account(json: JSONObject) = SalomAccount(json.getString("id"), json.getString("name"), json.optString("username"), "", json.optBoolean("is_active"))
 
-    suspend fun sendMessage(peerId: String, text: String, clientId: String): Message = withContext(Dispatchers.IO) {
+    suspend fun sendMessage(peerId: String, text: String, clientId: String, attachment: Attachment? = null): Message = withContext(Dispatchers.IO) {
         syncLocal()
-        message(request("messages", JSONObject().put("recipient_id", peerId).put("text", text).put("client_id", clientId), "POST"))
+        message(request("messages", JSONObject().put("recipient_id", peerId).put("text", text).put("client_id", clientId).apply { attachment?.let { put("attachment_id", it.id) } }, "POST"))
     }
 
     suspend fun messages(peerId: String, after: Long): MessageBatch = withContext(Dispatchers.IO) {
         syncLocal()
         val result = request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8") + "&after=$after")
         val array = result.getJSONArray("messages")
-        MessageBatch((0 until array.length()).map { message(array.getJSONObject(it)) }, result.optBoolean("has_more"))
+        MessageBatch((0 until array.length()).map { message(array.getJSONObject(it)) }, result.optBoolean("has_more"), result.optLong("cleared_through"))
     }
 
     suspend fun conversations(): List<ConversationPreview> = withContext(Dispatchers.IO) {
@@ -129,8 +129,54 @@ internal class DirectoryClient(context: Context) {
         account(request("profiles/" + URLEncoder.encode(peerId, "UTF-8")))
     }
 
+
+    suspend fun clearConversation(peerId: String): Long = withContext(Dispatchers.IO) {
+        request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8"), method = "DELETE").getLong("cleared_through")
+    }
+    private fun mediaConnection(path: String): HttpURLConnection = (URL("https://mukimov.site/salom/api/" + path).openConnection() as HttpURLConnection).apply {
+        connectTimeout = 10000; readTimeout = 60000; instanceFollowRedirects = false
+        setRequestProperty("Authorization", "Bearer $token")
+    }
+    private fun mediaError(connection: HttpURLConnection): Nothing {
+        val body = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        val detail = runCatching { JSONObject(body).optString("detail") }.getOrDefault("")
+        throw DirectoryException(detail.ifBlank { "Не удалось передать файл. Попробуй снова" }, connection.responseCode)
+    }
+    internal fun uploadAttachment(peer: String, attachment: Attachment, file: java.io.File): Attachment {
+        val connection = mediaConnection("attachments?peer_id=" + URLEncoder.encode(peer, "UTF-8") + "&name=" + URLEncoder.encode(attachment.name, "UTF-8"))
+        try {
+            connection.requestMethod = "POST"; connection.doOutput = true
+            connection.setRequestProperty("Content-Type", attachment.mime)
+            connection.setFixedLengthStreamingMode(file.length())
+            connection.outputStream.use { output -> file.inputStream().use { it.copyTo(output, 64 * 1024) } }
+            if (connection.responseCode !in 200..299) mediaError(connection)
+            return Attachment.from(JSONObject(connection.inputStream.bufferedReader().use { it.readText() }))
+        } catch (failure: DirectoryException) { throw failure }
+        catch (_: Exception) { throw DirectoryException("Не удалось загрузить файл. Проверь интернет и повтори") }
+        finally { connection.disconnect() }
+    }
+    internal fun downloadAttachment(attachment: Attachment, file: java.io.File) {
+        val connection = mediaConnection("attachments/" + attachment.id)
+        val temporary = java.io.File(file.parentFile, attachment.id + ".part")
+        try {
+            if (connection.responseCode !in 200..299) mediaError(connection)
+            var total = 0L
+            connection.inputStream.use { input -> temporary.outputStream().use { output ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) { val count = input.read(buffer); if (count < 0) break; total += count
+                    if (total > MediaFiles.MAX_FILE || total > attachment.size) throw DirectoryException("Неверный размер вложения")
+                    output.write(buffer, 0, count)
+                }
+            } }
+            if (total != attachment.size) throw DirectoryException("Файл загружен не полностью. Повтори попытку")
+            if (!temporary.renameTo(file)) throw DirectoryException("Не удалось сохранить файл")
+        } catch (failure: DirectoryException) { throw failure }
+        catch (_: Exception) { throw DirectoryException("Не удалось скачать файл. Проверь интернет и повтори") }
+        finally { temporary.delete(); connection.disconnect() }
+    }
+
     private fun message(json: JSONObject): Message {
         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date((json.getDouble("created") * 1000).toLong()))
-        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"))
+        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"), json.optJSONObject("attachment")?.let { Attachment.from(it) })
     }
 }

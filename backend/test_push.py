@@ -86,4 +86,14 @@ class PushTests(unittest.TestCase):
             app.register_push(app.PushTokenInput(token='fcm_' + 'x' * 64), 'Bearer ' + self.tokens[0])
         self.assertEqual(raised.exception.status_code, 409)
 
+    def test_cleared_recipient_skips_queued_push(self):
+        message = self.send()
+        with app.connect() as db:
+            db.execute('INSERT INTO conversation_clears VALUES(?,?,?)', (self.ids[1], self.ids[0], message['id']))
+        self.dispatcher.session = Session(Response(200))
+        self.dispatcher.project = 'qa-project'
+        self.assertTrue(self.dispatcher.deliver_one())
+        self.assertEqual(self.dispatcher.session.sent, [])
+        with app.connect() as db: self.assertEqual(db.execute('SELECT state FROM push_jobs').fetchone()[0], 'skipped')
+
 if __name__ == '__main__': unittest.main()

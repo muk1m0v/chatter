@@ -17,14 +17,14 @@ backup = Path('/var/backups') / ('salom-api-' + stamp)
 backup.mkdir(mode=0o700)
 config = Path('/etc/nginx/sites-available/ryadom')
 shutil.copy2(config, backup / 'nginx.conf')
-for filename in ('app.py', 'push.py', 'auth.py', 'requirements.txt'):
+for filename in ('app.py', 'push.py', 'auth.py', 'media.py', 'requirements.txt'):
     if (destination / filename).exists(): shutil.copy2(destination / filename, backup / filename)
 if Path('/etc/systemd/system/salom-api.service').exists(): shutil.copy2('/etc/systemd/system/salom-api.service', backup / 'salom-api.service')
 database = Path('/var/lib/salom-api/directory.sqlite3')
 if database.exists():
     with sqlite3.connect(database) as origin, sqlite3.connect(backup / 'directory.sqlite3') as saved:
         origin.backup(saved)
-for filename in ('app.py', 'push.py', 'auth.py', 'requirements.txt'):
+for filename in ('app.py', 'push.py', 'auth.py', 'media.py', 'requirements.txt'):
     shutil.copy2(source / filename, destination / filename)
     (destination / filename).chmod(0o644)
 shutil.copy2(source / 'salom-api.service', '/etc/systemd/system/salom-api.service')
@@ -48,7 +48,7 @@ if 'location ^~ /salom/api/' not in text:
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
-        client_max_body_size 64k;
+        client_max_body_size 25m;
         proxy_connect_timeout 3s;
         proxy_read_timeout 12s;
         add_header Cache-Control no-store;
@@ -57,7 +57,7 @@ if 'location ^~ /salom/api/' not in text:
 else:
     start = text.index('    location ^~ /salom/api/')
     end = text.index('\n    }', start)
-    text = text[:start] + text[start:end].replace('client_max_body_size 8k;', 'client_max_body_size 64k;') + text[end:]
+    text = text[:start] + text[start:end].replace('client_max_body_size 8k;', 'client_max_body_size 25m;').replace('client_max_body_size 64k;', 'client_max_body_size 25m;') + text[end:]
 try:
     config.write_text(text)
     subprocess.run(['nginx', '-t'], check=True)

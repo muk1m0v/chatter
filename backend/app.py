@@ -15,6 +15,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
+import media
 from push import PushDispatcher
 from auth import schema as auth_schema, install_routes as install_auth_routes
 
@@ -58,6 +59,7 @@ def initialize():
         CREATE INDEX IF NOT EXISTS push_jobs_pending ON push_jobs(state,next_at);
         ''')
         auth_schema(db)
+        media.schema(db)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -76,7 +78,7 @@ async def validation_error(request, exception):
 
 @app.middleware('http')
 async def bounds(request: Request, call_next):
-    if int(request.headers.get('content-length', '0') or 0) > 65536:
+    if int(request.headers.get('content-length', '0') or 0) > (media.MAX_FILE if request.url.path == '/attachments' else 65536):
         return JSONResponse({'detail': 'Слишком большой запрос'}, status_code=413)
     response = await call_next(request)
     response.headers['Cache-Control'] = 'no-store'
@@ -166,15 +168,17 @@ def current_profile(authorization):
         return dict(row)
 
 install_auth_routes(app, connect, current_profile, public, digest)
+media.install_routes(app, connect, current_profile)
 
-def message_json(row):
-    return {key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}
+def message_json(row, db):
+    return {**{key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}, 'attachment': media.metadata(db, row['attachment_id'])}
 
 class MessageInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     recipient_id: str = Field(min_length=36, max_length=36)
     client_id: str = Field(min_length=36, max_length=36)
-    text: str = Field(min_length=1, max_length=4000)
+    text: str = Field(default='', max_length=4000)
+    attachment_id: str | None = Field(default=None, min_length=36, max_length=36)
 
 @app.post('/messages')
 def send_message(body: MessageInput, authorization: str | None = Header(default=None)):
@@ -184,7 +188,7 @@ def send_message(body: MessageInput, authorization: str | None = Header(default=
         UUID(body.client_id)
     except ValueError: raise HTTPException(400, 'Неверный идентификатор сообщения или получателя')
     text = body.text.strip()
-    if not text: raise HTTPException(400, 'Сообщение не может быть пустым')
+    if not text and not body.attachment_id: raise HTTPException(400, 'Сообщение не может быть пустым')
     if body.recipient_id == me['id']: raise HTTPException(400, 'Для личных заметок используй Избранное')
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -192,13 +196,17 @@ def send_message(body: MessageInput, authorization: str | None = Header(default=
             raise HTTPException(404, 'Получатель недоступен')
         existing = db.execute('SELECT * FROM messages WHERE sender_id=? AND client_id=?', (me['id'], body.client_id)).fetchone()
         if existing:
-            if existing['recipient_id'] != body.recipient_id or existing['text'] != text:
+            if existing['recipient_id'] != body.recipient_id or existing['text'] != text or existing['attachment_id'] != body.attachment_id:
                 raise HTTPException(409, 'Этот идентификатор уже использован для другого сообщения')
-            return message_json(existing)
-        cursor = db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created) VALUES(?,?,?,?,?)', (me['id'], body.recipient_id, body.client_id, text, time.time()))
+            return message_json(existing, db)
+        if body.attachment_id:
+            attachment = db.execute('SELECT * FROM attachments WHERE id=? AND owner_id=? AND peer_id=? AND ready=1', (body.attachment_id, me['id'], body.recipient_id)).fetchone()
+            if not attachment: raise HTTPException(400, 'Вложение недоступно')
+            if db.execute('SELECT 1 FROM messages WHERE attachment_id=?', (body.attachment_id,)).fetchone(): raise HTTPException(409, 'Вложение уже отправлено')
+        cursor = db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created,attachment_id) VALUES(?,?,?,?,?,?)', (me['id'], body.recipient_id, body.client_id, text, time.time(), body.attachment_id))
         db.execute('INSERT INTO push_jobs(message_id) VALUES(?)', (cursor.lastrowid,))
         app.state.push.wake.set()
-        return message_json(db.execute('SELECT * FROM messages WHERE id=?', (cursor.lastrowid,)).fetchone())
+        return message_json(db.execute('SELECT * FROM messages WHERE id=?', (cursor.lastrowid,)).fetchone(), db)
 
 class PushTokenInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -231,10 +239,11 @@ def get_profile(peer_id: str, authorization: str | None = Header(default=None)):
 def get_messages(peer_id: str, after: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
     me = current_profile(authorization)
     with connect() as db:
+        cleared = media.cutoff(db, me['id'], peer_id)
         rows = db.execute('''SELECT * FROM messages WHERE id>? AND
           ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))
-          ORDER BY id LIMIT 100''', (after, me['id'], peer_id, peer_id, me['id'])).fetchall()
-        return {'messages': [message_json(row) for row in rows], 'has_more': len(rows) == 100}
+          ORDER BY id LIMIT 100''', (max(after, cleared), me['id'], peer_id, peer_id, me['id'])).fetchall()
+        return {'messages': [message_json(row, db) for row in rows], 'has_more': len(rows) == 100, 'cleared_through': cleared}
 
 @app.get('/conversations')
 def conversations(authorization: str | None = Header(default=None)):
@@ -242,7 +251,7 @@ def conversations(authorization: str | None = Header(default=None)):
     with connect() as db:
         rows = db.execute('''WITH latest AS (
           SELECT CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS peer_id, MAX(id) AS last_id
-          FROM messages WHERE sender_id=? OR recipient_id=? GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)
-          SELECT p.*, m.text AS last_text, m.id AS last_message_id FROM latest l
-          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'])).fetchall()
+          FROM messages WHERE (sender_id=? OR recipient_id=?) AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END),0) GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)
+          SELECT p.*, COALESCE(NULLIF(m.text,''),'📎 Вложение') AS last_text, m.id AS last_message_id FROM latest l
+          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
         return {'conversations': [{'profile': public(row), 'last_text': row['last_text'], 'last_message_id': row['last_message_id']} for row in rows]}

@@ -58,7 +58,7 @@ internal val Yellow = Color(0xFFFFC400)
 internal val Ink = Color(0xFF25241F)
 private val Soft = Color(0xFFF5F5F3)
 internal data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "")
-internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0)
+internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0, val attachment: Attachment? = null)
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
 class MainActivity : ComponentActivity() {
@@ -101,12 +101,15 @@ internal class Store(context: Context) {
         if (raw.isEmpty()) return emptyList()
         return runCatching {
             val array = JSONArray(raw)
-            (0 until array.length()).map { val item = array.getJSONObject(it); Message(item.getString("text"), item.getBoolean("mine"), item.optString("time", "")) }.filter { it.mine }
+            (0 until array.length()).map { val item = array.getJSONObject(it); Message(item.getString("text"), item.getBoolean("mine"), item.optString("time", ""), attachment = item.optJSONObject("attachment")?.let { Attachment.from(it) }) }.filter { it.mine }
         }.getOrDefault(emptyList())
+    }
+    fun clearMessages(id: String) {
+        check(prefs.edit().remove("messages_${id}_${identity.getString("device_id", "")}").commit()) { "Не удалось очистить сообщения" }
     }
     fun saveMessages(id: String, messages: List<Message>) {
         val array = JSONArray()
-        messages.forEach { array.put(JSONObject().put("text", it.text).put("mine", it.mine).put("time", it.time)) }
+        messages.forEach { array.put(JSONObject().put("text", it.text).put("mine", it.mine).put("time", it.time).apply { it.attachment?.let { attachment -> put("attachment", attachment.json()) } }) }
         save("messages_${id}_${identity.getString("device_id", "")}", array.toString())
     }
 }
@@ -253,7 +256,7 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
             Header("Салом") { Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Box(Modifier.size(32.dp).clip(CircleShape).background(Yellow), contentAlignment = Alignment.Center) { Text(store.text("name", "С").take(1).uppercase(), fontSize = 14.sp, color = Ink, fontWeight = FontWeight.Bold) } } }
             CompactSearch(search, { search = it }, "Имя, username или номер")
             Spacer(Modifier.height(6.dp))
-            val preview = remember { store.messages("saved").lastOrNull()?.text ?: savedPerson.preview }
+            val preview = remember { store.messages("saved").lastOrNull()?.let { it.text.ifBlank { it.attachment?.name.orEmpty() } } ?: savedPerson.preview }
             val visible = listOf(savedPerson)
             if (search.isNotBlank()) SmartPeopleResults(context, search, accounts, directory, onOpenAccount, onProfile)
             else LazyColumn(contentPadding = PaddingValues(bottom = 90.dp)) {

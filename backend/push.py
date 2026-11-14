@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import media
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
@@ -12,7 +13,7 @@ from google.oauth2 import service_account
 log = logging.getLogger('salom.push')
 
 def payload(token, message, sender):
-    text = message['text']
+    text = message['text'] or '📎 Вложение'
     return {'message': {
         'token': token,
         'notification': {'title': sender['name'], 'body': text[:180] + ('…' if len(text) > 180 else '')},
@@ -68,7 +69,7 @@ class PushDispatcher:
             message = db.execute('SELECT * FROM messages WHERE id=?', (job['message_id'],)).fetchone()
             sender = db.execute('SELECT * FROM profiles WHERE id=?', (message['sender_id'],)).fetchone()
             target = db.execute('SELECT token FROM push_tokens WHERE profile_id=?', (message['recipient_id'],)).fetchone()
-            if not target or time.time() - message['created'] > 86400:
+            if not target or message['id'] <= media.cutoff(db, message['recipient_id'], message['sender_id']) or time.time() - message['created'] > 86400:
                 db.execute("UPDATE push_jobs SET state='skipped' WHERE message_id=?", (message['id'],))
                 return True
             token = target['token']
