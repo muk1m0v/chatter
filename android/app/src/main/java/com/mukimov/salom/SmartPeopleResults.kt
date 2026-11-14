@@ -22,26 +22,44 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 
 @Composable
-internal fun SmartPeopleResults(context: Context, query: String, accounts: List<SalomAccount>, onOpenAccount: (SalomAccount) -> Unit, onSelf: () -> Unit) {
+internal fun SmartPeopleResults(context: Context, query: String, accounts: List<SalomAccount>, directory: DirectoryClient, onOpenAccount: (SalomAccount) -> Unit, onSelf: () -> Unit) {
     var contacts by remember { mutableStateOf<List<PhoneContact>>(emptyList()) }
     var selected by remember { mutableStateOf<PhoneContact?>(null) }
+    var remote by remember { mutableStateOf<List<SalomAccount>>(emptyList()) }
+    var searching by remember { mutableStateOf(false) }
+    var remoteError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(query, accounts) {
+        remote = emptyList()
+        remoteError = null
+        searching = true
+        try {
+            delay(200)
+            remote = directory.search(query)
+        } catch (exception: CancellationException) { throw exception }
+        catch (exception: DirectoryException) { remoteError = exception.message }
+        finally { searching = false }
+    }
     LaunchedEffect(context) {
         if (context.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
             contacts = withContext(Dispatchers.IO) { try { readContacts(context) } catch (_: SecurityException) { emptyList() } }
         }
     }
-    val people = remember(query, accounts) { accounts.filter { it.is_active }.mapNotNull { account -> smartSearchScore(query, account.name, account.username, account.phone)?.let { account to it } }.sortedBy { it.second }.map { it.first } }
+    val people = remember(query, accounts, remote) { (accounts + remote).distinctBy { if (it.username.isNotBlank()) it.username.lowercase() else it.id }.filter { it.is_active }.mapNotNull { account -> smartSearchScore(query, account.name, account.username, account.phone)?.let { account to it } }.sortedBy { it.second }.map { it.first } }
     val matchedContacts = remember(query, contacts, accounts) { contacts.filter { contact -> accounts.none { it.is_active && it.phone.isNotBlank() && canonicalPhone(it.phone) == canonicalPhone(contact.number) } }.mapNotNull { contact -> smartSearchScore(query, contact.name, phone = contact.number)?.let { contact to it } }.sortedBy { it.second }.map { it.first } }
     LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(bottom = 88.dp)) {
+        if (searching) item { SectionLabel("Поиск в Салом…") }
+        remoteError?.let { message -> item { Text(message, fontSize = 12.sp, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp)) } }
         if (people.isNotEmpty()) item { SectionLabel("Профили") }
         items(people, key = { "account:${it.id}" }, contentType = { "account" }) { account ->
-            SearchRow(account.name, if (account.username.isNotBlank()) "@${account.username}" else "Мой профиль") { if (account.id == "self") onSelf() else onOpenAccount(account) }
+            SearchRow(account.name, if (account.username.isNotBlank()) "@${account.username}" else "Мой профиль") { if (account.id == "self" || account.id == directory.ownId) onSelf() else onOpenAccount(account) }
         }
         if (matchedContacts.isNotEmpty()) item { SectionLabel("Контакты телефона") }
         items(matchedContacts, key = { "contact:${it.key}" }, contentType = { "phone" }) { contact -> SearchRow(contact.name, contact.number) { selected = contact } }
-        if (people.isEmpty() && matchedContacts.isEmpty()) item {
+        if (people.isEmpty() && matchedContacts.isEmpty() && !searching && remoteError == null) item {
             Column(Modifier.fillMaxWidth().padding(30.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("Ничего не найдено", fontWeight = FontWeight.Medium)
                 Text("Попробуй начало имени, username или номер", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))

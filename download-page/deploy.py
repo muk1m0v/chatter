@@ -9,7 +9,7 @@ import shutil
 import subprocess
 
 incoming = Path('/tmp/salom-deploy')
-apk = incoming / 'salom-0.3.1.apk'
+apk = incoming / 'salom-0.4.0.apk'
 assert apk.is_file() and apk.stat().st_size > 100_000
 assert (incoming / 'index.html').is_file()
 config = Path('/etc/nginx/sites-available/ryadom')
@@ -23,7 +23,7 @@ target = Path('/var/www/salom')
 target.mkdir(parents=True, exist_ok=True)
 shutil.copy2(apk, target / apk.name)
 shutil.copy2(apk, target / 'salom-latest.apk')
-metadata = {'version': '0.3.1', 'versionCode': 5, 'minSdk': 23, 'downloadUrl': 'https://mukimov.site/salom/salom-latest.apk', 'size': apk.stat().st_size, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest()}
+metadata = {'version': '0.4.0', 'versionCode': 6, 'minSdk': 23, 'downloadUrl': 'https://mukimov.site/salom/salom-latest.apk', 'size': apk.stat().st_size, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest()}
 (target / 'version.json').write_text(json.dumps(metadata, indent=2) + '\n')
 for file in target.iterdir():
     if file.is_file(): file.chmod(0o644)
@@ -37,7 +37,7 @@ if marker in new_config:
 if marker not in new_config:
     routes = marker
     for filename in sorted(file.name for file in target.glob('salom-*.apk')):
-        download_name = 'salom-0.3.1.apk' if filename == 'salom-latest.apk' else filename
+        download_name = 'salom-0.4.0.apk' if filename == 'salom-latest.apk' else filename
         routes += f'''    location = /salom/{filename} {{
         alias /var/www/salom/{filename};
         default_type application/vnd.android.package-archive;
