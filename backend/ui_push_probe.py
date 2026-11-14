@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import urllib.request
 import uuid
+from qa_fixtures import enroll
 
 record = Path('/tmp/salom-push-ui-probe.json')
 base = 'https://mukimov.site/salom/api/'
@@ -18,6 +19,7 @@ def request(path, token, body=None, method=None):
 if sys.argv[1] == 'create':
     assert not record.exists()
     data = {'id': str(uuid.uuid4()), 'token': secrets.token_urlsafe(32), 'username': 'qapush_' + secrets.token_hex(4)}
+    enroll(data['id'], data['token'], 'Проверка уведомлений', data['username'])
     request('profile', data['token'], {'device_id': data['id'], 'name': 'Проверка уведомлений', 'username': data['username']})
     target = sys.argv[2].removeprefix('@')
     owner = next(p for p in request('search?q=' + target, data['token'])['profiles'] if p['username'].lower() == target.lower())

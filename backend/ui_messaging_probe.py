@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from qa_fixtures import enroll
 
 BASE = 'https://mukimov.site/salom/api/'
 record = Path('/tmp/salom-messaging-ui-probe.json')
@@ -27,6 +28,7 @@ else:
     assert not record.exists(), 'Clean up the previous probe first'
     data = {'id': str(uuid.uuid4()), 'username': 'qachat_' + secrets.token_hex(4)}
     token = secrets.token_urlsafe(32)
+    enroll(data['id'], token, 'QA переписки', data['username'])
     headers = {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}
     def request(path, body=None, method=None):
         req = urllib.request.Request(BASE + path, data=json.dumps(body, ensure_ascii=False).encode() if body else None, headers=headers, method=method or ('PUT' if body else 'GET'))

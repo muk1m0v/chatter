@@ -1,4 +1,4 @@
-"""Public username directory. Phone/email/contacts are deliberately not collected."""
+"""Salom profiles, messaging and verified accounts. Address books are never collected."""
 import hashlib
 import hmac
 import os
@@ -13,8 +13,10 @@ from uuid import UUID
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from push import PushDispatcher
+from auth import schema as auth_schema, install_routes as install_auth_routes
 
 DB = Path(os.environ.get('SALOM_DB', '/var/lib/salom-api/directory.sqlite3'))
 USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9_]{3,23}$')
@@ -55,6 +57,7 @@ def initialize():
           next_at REAL NOT NULL DEFAULT 0, last_error TEXT);
         CREATE INDEX IF NOT EXISTS push_jobs_pending ON push_jobs(state,next_at);
         ''')
+        auth_schema(db)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -65,6 +68,11 @@ async def lifespan(app):
     app.state.push.stop()
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exception):
+    # Validation responses must not echo submitted passwords, verification codes or tokens.
+    return JSONResponse({'detail': 'Проверь введённые данные'}, status_code=422)
 
 @app.middleware('http')
 async def bounds(request: Request, call_next):
@@ -121,30 +129,26 @@ def profile(body: ProfileInput, request: Request, authorization: str | None = He
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         existing = db.execute('SELECT * FROM profiles WHERE id=?', (body.device_id,)).fetchone()
-        if existing and not hmac.compare_digest(existing['token_hash'], hashed):
-            raise HTTPException(403, 'Этот профиль принадлежит другому устройству')
         if not existing:
-            ip = request.client.host if request.client else 'unknown'
-            db.execute('DELETE FROM registrations WHERE at<?', (now - 86400,))
-            if db.execute('SELECT count(*) FROM registrations WHERE ip=? AND at>?', (ip, now - 3600)).fetchone()[0] >= 10:
-                raise HTTPException(429, 'Лимит новых профилей. Попробуй позже')
+            raise HTTPException(426, 'Обнови Салом и войди через Google для регистрации')
+        if existing and not hmac.compare_digest(existing['token_hash'], hashed):
+            session = db.execute('SELECT profile_id FROM sessions WHERE token_hash=? AND expires>?', (hashed, now)).fetchone()
+            if not session or session['profile_id'] != body.device_id:
+                raise HTTPException(403, 'Этот профиль принадлежит другому устройству')
+        if existing and db.execute('SELECT 1 FROM accounts WHERE profile_id=?', (body.device_id,)).fetchone() and not username:
+            raise HTTPException(400, 'У подтверждённого аккаунта должен быть username')
+        if existing and username.lower() != (existing['username_key'] or '') and not db.execute('SELECT 1 FROM accounts WHERE profile_id=?', (body.device_id,)).fetchone():
+            raise HTTPException(403, 'Подключи Google перед выбором нового username')
         try:
-            if existing:
-                db.execute('UPDATE profiles SET name=?,username=?,username_key=?,updated=? WHERE id=?', (name, username or None, username.lower() or None, now, body.device_id))
-            else:
-                db.execute('INSERT INTO profiles VALUES(?,?,?,?,?,1,?,?)', (body.device_id, hashed, name, username or None, username.lower() or None, now, now))
-                db.execute('INSERT INTO registrations VALUES(?,?)', (ip, now))
+            db.execute('UPDATE profiles SET name=?,username=?,username_key=?,updated=? WHERE id=?', (name, username or None, username.lower() or None, now, body.device_id))
         except sqlite3.IntegrityError:
             raise HTTPException(409, 'Этот username уже занят. Выбери другой')
         return public(db.execute('SELECT * FROM profiles WHERE id=?', (body.device_id,)).fetchone())
 
 @app.get('/search')
 def search(q: str = Query(min_length=1, max_length=64), authorization: str | None = Header(default=None)):
-    hashed = digest(authorization)
+    current_profile(authorization)
     with connect() as db:
-        if not db.execute('SELECT id FROM profiles WHERE token_hash=? AND is_active=1', (hashed,)).fetchone():
-            raise HTTPException(401, 'Сначала синхронизируй свой профиль')
-        throttle(hashed)
         prefix = q.strip().removeprefix('@').lower()
         if not re.fullmatch(r'[a-z0-9_]{1,24}', prefix): return {'profiles': []}
         pattern = prefix.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
@@ -155,9 +159,13 @@ def current_profile(authorization):
     hashed = digest(authorization)
     with connect() as db:
         row = db.execute('SELECT * FROM profiles WHERE token_hash=? AND is_active=1', (hashed,)).fetchone()
+        if not row:
+            row = db.execute('SELECT p.* FROM profiles p JOIN sessions s ON s.profile_id=p.id WHERE s.token_hash=? AND s.expires>? AND p.is_active=1', (hashed, time.time())).fetchone()
         if not row: raise HTTPException(401, 'Требуется активный профиль')
         throttle(hashed)
         return dict(row)
+
+install_auth_routes(app, connect, current_profile, public, digest)
 
 def message_json(row):
     return {key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}

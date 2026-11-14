@@ -6,6 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from qa_fixtures import enroll
 
 BASE = 'https://mukimov.site/salom/api/'
 accounts = []
@@ -22,6 +23,7 @@ try:
     for index in range(3):
         account = {'id': str(uuid.uuid4()), 'token': secrets.token_urlsafe(32), 'username': f'qam{index}_{suffix}'}
         accounts.append(account)
+        enroll(account['id'], account['token'], 'Messaging QA', account['username'])
         status, result = request('profile', account['token'], {'device_id': account['id'], 'name': 'Messaging QA', 'username': account['username']})
         assert status == 200, result
     a, b, outsider = accounts

@@ -13,11 +13,11 @@ import java.net.URLEncoder
 import java.security.SecureRandom
 import java.util.UUID
 
-internal class DirectoryException(message: String) : Exception(message)
+internal class DirectoryException(message: String, val status: Int = 0) : Exception(message)
 internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
 internal data class MessageBatch(val messages: List<Message>, val hasMore: Boolean)
 
-/** Installation credential authenticates only this public profile; phones/emails never leave the device. */
+/** Private installation/session credential for the Salom API. Google sign-in uses AuthClient. */
 internal class DirectoryClient(context: Context) {
     private val identity = context.getSharedPreferences("salom_directory", Context.MODE_PRIVATE)
     private val local = context.getSharedPreferences("salom_local", Context.MODE_PRIVATE)
@@ -25,8 +25,23 @@ internal class DirectoryClient(context: Context) {
     private var syncedSignature: Pair<String, String>? = null
     val ownId: String = identity.getString("device_id", null) ?: UUID.randomUUID().toString().also { identity.edit().putString("device_id", it).commit() }
     private val token: String = identity.getString("token", null) ?: ByteArray(32).also { SecureRandom().nextBytes(it) }.let { Base64.encodeToString(it, Base64.NO_WRAP or Base64.URL_SAFE or Base64.NO_PADDING) }.also { identity.edit().putString("token", it).commit() }
+    init {
+        // Recover the profile projection if the process stopped between the two preference writes.
+        if (local.getString("owner_profile_id", "") != ownId) {
+            identity.getString("auth_snapshot", null)?.let { raw ->
+                runCatching {
+                    val snapshot = JSONObject(raw)
+                    val profile = snapshot.getJSONObject("profile")
+                    if (profile.getString("id") == ownId) local.edit().remove("about")
+                        .putString("name", profile.getString("name")).putString("username", profile.getString("username"))
+                        .remove("phone").putString("email", snapshot.optString("email"))
+                        .putString("owner_profile_id", ownId).putString("account_verified", "yes").putString("signed_in", "yes").commit()
+                }
+            }
+        }
+    }
 
-    private fun request(path: String, body: JSONObject? = null, method: String = if (body != null) "PUT" else "GET"): JSONObject {
+    internal fun request(path: String, body: JSONObject? = null, method: String = if (body != null) "PUT" else "GET"): JSONObject {
         val connection = URL("https://mukimov.site/salom/api/$path").openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = 7000
@@ -48,7 +63,7 @@ internal class DirectoryClient(context: Context) {
             val result = runCatching { JSONObject(text) }.getOrElse { JSONObject() }
             if (code !in 200..299) {
                 val detail = result.opt("detail")
-                throw DirectoryException(if (detail is String && detail.isNotBlank()) detail else "Каталог временно недоступен ($code)")
+                throw DirectoryException(if (detail is String && detail.isNotBlank()) detail else "Сервер временно недоступен ($code)", code)
             }
             return result
         } catch (exception: DirectoryException) { throw exception }

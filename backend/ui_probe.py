@@ -8,6 +8,7 @@ import sys
 import urllib.parse
 import urllib.request
 import uuid
+from qa_fixtures import enroll
 
 record = Path('/tmp/salom-directory-ui-probe.json')
 database = '/var/lib/salom-api/directory.sqlite3'
@@ -15,6 +16,7 @@ if sys.argv[1] == 'cleanup':
     data = json.loads(record.read_text())
     assert data['username'].startswith('qaremote_')
     with sqlite3.connect(database) as db:
+        db.execute('PRAGMA foreign_keys=ON')
         db.execute('DELETE FROM profiles WHERE id=? AND username=?', (data['id'], data['username']))
     record.unlink()
     print('UI_PROBE_REMOVED')
@@ -22,6 +24,7 @@ else:
     assert not record.exists(), 'Clean up the previous UI probe first'
     data = {'id': str(uuid.uuid4()), 'username': 'qaremote_' + secrets.token_hex(4)}
     token = secrets.token_urlsafe(32)
+    enroll(data['id'], token, 'QA каталога (проверка)', data['username'])
     headers = {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}
     body = {'device_id': data['id'], 'name': 'QA каталога (проверка)', 'username': data['username']}
     try:
@@ -35,5 +38,7 @@ else:
         with os.fdopen(descriptor, 'w') as output: json.dump(data, output)
         print(json.dumps({'username': data['username'], 'target_visible_from_second_account': True}))
     except Exception:
-        with sqlite3.connect(database) as db: db.execute('DELETE FROM profiles WHERE id=?', (data['id'],))
+        with sqlite3.connect(database) as db:
+            db.execute('PRAGMA foreign_keys=ON')
+            db.execute('DELETE FROM profiles WHERE id=?', (data['id'],))
         raise

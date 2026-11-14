@@ -17,12 +17,14 @@ backup = Path('/var/backups') / ('salom-api-' + stamp)
 backup.mkdir(mode=0o700)
 config = Path('/etc/nginx/sites-available/ryadom')
 shutil.copy2(config, backup / 'nginx.conf')
-if (destination / 'app.py').exists(): shutil.copy2(destination / 'app.py', backup / 'app.py')
+for filename in ('app.py', 'push.py', 'auth.py', 'requirements.txt'):
+    if (destination / filename).exists(): shutil.copy2(destination / filename, backup / filename)
+if Path('/etc/systemd/system/salom-api.service').exists(): shutil.copy2('/etc/systemd/system/salom-api.service', backup / 'salom-api.service')
 database = Path('/var/lib/salom-api/directory.sqlite3')
 if database.exists():
     with sqlite3.connect(database) as origin, sqlite3.connect(backup / 'directory.sqlite3') as saved:
         origin.backup(saved)
-for filename in ('app.py', 'push.py', 'requirements.txt'):
+for filename in ('app.py', 'push.py', 'auth.py', 'requirements.txt'):
     shutil.copy2(source / filename, destination / filename)
     (destination / filename).chmod(0o644)
 shutil.copy2(source / 'salom-api.service', '/etc/systemd/system/salom-api.service')

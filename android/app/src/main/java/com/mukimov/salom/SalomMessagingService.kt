@@ -46,6 +46,7 @@ internal object PushNotifications {
 class PushRegistrationWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result {
         val local = applicationContext.getSharedPreferences("salom_local", Context.MODE_PRIVATE)
+        if (local.getString("signed_in", "") != "yes") return Result.success()
         // Keep a disabled registration after sign-out so old pushes stop on this installation.
         if (local.getString("name", "").isNullOrBlank()) return Result.success()
         val token = suspendCancellableCoroutine<String?> { continuation ->

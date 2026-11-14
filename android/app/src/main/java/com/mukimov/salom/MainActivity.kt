@@ -86,10 +86,18 @@ class MainActivity : ComponentActivity() {
 
 internal class Store(context: Context) {
     val prefs = context.getSharedPreferences("salom_local", Context.MODE_PRIVATE)
+    private val identity = context.getSharedPreferences("salom_directory", Context.MODE_PRIVATE)
+    init {
+        val owner = identity.getString("device_id", "").orEmpty()
+        if (owner.isNotEmpty() && !prefs.getBoolean("notes_scoped", false)) {
+            val legacy = prefs.getString("messages_saved", null)
+            prefs.edit().apply { if (legacy != null) putString("messages_saved_$owner", legacy); remove("messages_saved"); putBoolean("notes_scoped", true) }.commit()
+        }
+    }
     fun text(key: String, fallback: String = "") = prefs.getString(key, fallback) ?: fallback
     fun save(key: String, value: String) { prefs.edit().putString(key, value).apply() }
     fun messages(id: String): List<Message> {
-        val raw = text("messages_$id")
+        val raw = text("messages_${id}_${identity.getString("device_id", "")}")
         if (raw.isEmpty()) return emptyList()
         return runCatching {
             val array = JSONArray(raw)
@@ -99,14 +107,17 @@ internal class Store(context: Context) {
     fun saveMessages(id: String, messages: List<Message>) {
         val array = JSONArray()
         messages.forEach { array.put(JSONObject().put("text", it.text).put("mine", it.mine).put("time", it.time)) }
-        save("messages_$id", array.toString())
+        save("messages_${id}_${identity.getString("device_id", "")}", array.toString())
     }
 }
 
 @Composable
 private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: String?, onNotificationHandled: () -> Unit) {
+    var credentialVersion by remember { mutableIntStateOf(0) }
+    val directory = remember(credentialVersion) { DirectoryClient(context) }
     val store = remember { Store(context) }
-    val directory = remember { DirectoryClient(context) }
+    val appScope = rememberCoroutineScope()
+    var securingAccount by remember { mutableStateOf(false) }
     var directoryError by remember { mutableStateOf<String?>(null) }
     var signedIn by remember { mutableStateOf(store.text("signed_in") == "yes") }
     var dark by remember { mutableStateOf(store.text("dark") == "yes") }
@@ -139,7 +150,10 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
     LaunchedEffect(profileVersion, signedIn) {
         if (signedIn) {
             try { directory.syncLocal(); directoryError = null }
-            catch (exception: DirectoryException) { directoryError = exception.message }
+            catch (exception: DirectoryException) {
+                directoryError = exception.message
+                if (exception.status == 401 && store.text("account_verified") == "yes") { signedIn = false; activeChat = null }
+            }
         }
     }
     val openAccount: (SalomAccount) -> Unit = { account -> activeChat = if (account.id == "self") savedPerson else Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username) }
@@ -156,8 +170,10 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
     MaterialTheme(colorScheme = scheme, typography = Typography()) {
         Surface(Modifier.fillMaxSize(), color = scheme.background) {
           Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout)).imePadding()) {
-            if (!signedIn) {
-                Welcome(store) { signedIn = true }
+            if (!signedIn || securingAccount) {
+                AuthScreen(context, directory, securingAccount, onSuccess = {
+                    credentialVersion++; profileVersion++; directoryError = null; activeChat = null; signedIn = true; securingAccount = false
+                }, onCancel = if (securingAccount) ({ securingAccount = false }) else null)
             } else if (activeChat != null) {
                 BackHandler { activeChat = null }
                 key(activeChat!!.id) {
@@ -187,8 +203,10 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
                                 Box(Modifier.weight(1f)) { Chats(context, store, accounts, directory, openAccount, { activeChat = it }, { tab = 1 }, { tab = 3 }) }
                             }
                             1 -> PhoneContacts(context, accounts, openAccount)
-                            2 -> Settings(updater, dark, { dark = it; store.save("dark", if (it) "yes" else "no") }, { store.save("signed_in", "no"); signedIn = false; tab = 0 })
-                            else -> Profile(store, profileVersion, directory, directoryError) { directoryError = null; profileVersion++ }
+                            2 -> Settings(updater, dark, { dark = it; store.save("dark", if (it) "yes" else "no") }, {
+                                appScope.launch { AuthClient(context, directory).logout(); activeChat = null; signedIn = false; securingAccount = false; tab = 0 }
+                            })
+                            else -> Profile(store, profileVersion, directory, directoryError, { securingAccount = true }) { directoryError = null; profileVersion++ }
                         }
                     }
                 }
@@ -196,45 +214,6 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
         }
     }
   }
-}
-
-@Composable
-private fun Welcome(store: Store, onEnter: () -> Unit) {
-    var emailMode by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf(store.text("name")) }
-    var identity by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf("") }
-    Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(36.dp))
-        Box(Modifier.size(88.dp).clip(RoundedCornerShape(28.dp)).background(Yellow), contentAlignment = Alignment.Center) { NavIcon(0, Ink, Modifier.size(46.dp)) }
-        Spacer(Modifier.height(22.dp))
-        Text("Салом", fontSize = 42.sp, fontWeight = FontWeight.Bold)
-        Text("Ближе к своим", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 17.sp)
-        Spacer(Modifier.height(32.dp))
-        Text("Давай знакомиться", Modifier.fillMaxWidth(), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(16.dp))
-        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(MaterialTheme.colorScheme.surface).padding(4.dp)) {
-            listOf("Телефон", "Email").forEachIndexed { index, label ->
-                val selected = emailMode == (index == 1)
-                Box(Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(if (selected) Yellow else Color.Transparent).clickable { emailMode = index == 1; identity = ""; error = "" }.padding(13.dp), contentAlignment = Alignment.Center) { Text(label, color = if (selected) Ink else MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Medium) }
-            }
-        }
-        Spacer(Modifier.height(16.dp))
-        OutlinedTextField(name, { name = it.take(40) }, label = { Text("Твоё имя") }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp))
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(identity, { identity = it.take(120); error = "" }, label = { Text(if (emailMode) "Email" else "Номер телефона") }, placeholder = { Text(if (emailMode) "name@example.com" else "+992 …") }, keyboardOptions = KeyboardOptions(keyboardType = if (emailMode) KeyboardType.Email else KeyboardType.Phone), singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), isError = error.isNotEmpty())
-        if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
-        Spacer(Modifier.height(22.dp))
-        Button(onClick = {
-            val valid = if (emailMode) android.util.Patterns.EMAIL_ADDRESS.matcher(identity.trim()).matches() else identity.filterNot { it.isWhitespace() || it in "()-" }.matches(Regex("\\+[1-9][0-9]{6,14}"))
-            if (name.isBlank()) error = "Напиши, как к тебе обращаться"
-            else if (!valid) error = if (emailMode) "Проверь адрес email" else "Введи номер с + и кодом страны"
-            else { store.save("name", name.trim()); store.save(if (emailMode) "email" else "phone", (if (emailMode) identity.trim() else identity.filterNot { it.isWhitespace() || it in "()-" })); store.save("signed_in", "yes"); onEnter() }
-        }, modifier = Modifier.fillMaxWidth().height(54.dp), shape = RoundedCornerShape(17.dp)) { Text("Продолжить", fontWeight = FontWeight.Bold, fontSize = 15.sp) }
-        Spacer(Modifier.height(20.dp))
-        Text("Имя и username доступны в Салом. Номер и email пока остаются на устройстве.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(24.dp))
-    }
 }
 
 @Composable
@@ -319,7 +298,7 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
 }
 
 @Composable
-private fun Profile(store: Store, version: Int, directory: DirectoryClient, syncError: String?, onChanged: () -> Unit) {
+private fun Profile(store: Store, version: Int, directory: DirectoryClient, syncError: String?, onVerify: () -> Unit, onChanged: () -> Unit) {
     var edit by remember { mutableStateOf(false) }
     val name = remember(version) { store.text("name", "Твой профиль") }
     val about = remember(version) { store.text("about", "Салом! Я на связи 💛") }
@@ -343,6 +322,7 @@ private fun Profile(store: Store, version: Int, directory: DirectoryClient, sync
                 Detail(about, "О себе")
             }
         }
+        AccountSecurityCard(directory, onVerify)
         Spacer(Modifier.height(18.dp))
         Text("Всё начинается с «Салом»", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }

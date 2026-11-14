@@ -44,3 +44,6 @@ Thumbs.db
 *firebase-adminsdk*.json
 firebase-admin.json
 service-account*.json
+smtp*.json
+*app-password*.txt
+auth-secret*

@@ -6,6 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from qa_fixtures import enroll
 
 BASE = 'https://mukimov.site/salom/api/'
 profiles = []
@@ -25,6 +26,7 @@ try:
     for name in ('alpha', 'beta'):
         item = {'id': str(uuid.uuid4()), 'token': secrets.token_urlsafe(32), 'username': 'qa' + name + '_' + suffix}
         profiles.append(item)
+        enroll(item['id'], item['token'], 'Directory QA ' + name, item['username'])
         status, public = request('profile', item['token'], {'device_id': item['id'], 'name': 'Directory QA ' + name, 'username': item['username']})
         assert status == 200, (status, public)
         assert 'phone' not in public and 'token_hash' not in public
@@ -52,5 +54,6 @@ try:
     print('REMOTE_RENAME_PROPAGATES=PASS')
 finally:
     with sqlite3.connect('/var/lib/salom-api/directory.sqlite3') as db:
+        db.execute('PRAGMA foreign_keys=ON')
         for item in profiles: db.execute('DELETE FROM profiles WHERE id=?', (item['id'],))
     print('GENERATED_QA_PROFILES_REMOVED')

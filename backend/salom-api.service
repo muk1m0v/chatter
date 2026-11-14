@@ -19,7 +19,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-MemoryMax=192M
+MemoryMax=256M
 UMask=0077
 
 [Install]
