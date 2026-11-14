@@ -2,7 +2,14 @@ package com.mukimov.salom
 
 import android.content.Context
 import android.os.Bundle
-import android.view.View
+import androidx.activity.enableEdgeToEdge
+import androidx.core.view.WindowCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.CancellationException
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -47,25 +54,23 @@ import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.launch
 
-private val Yellow = Color(0xFFFFC400)
-private val Ink = Color(0xFF25241F)
+internal val Yellow = Color(0xFFFFC400)
+internal val Ink = Color(0xFF25241F)
 private val Soft = Color(0xFFF5F5F3)
-private data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "")
-private data class Message(val text: String, val mine: Boolean, val time: String = "")
+internal data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "")
+internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0)
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
 class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = android.graphics.Color.rgb(245,245,243)
-        window.navigationBarColor = android.graphics.Color.rgb(245,245,243)
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        enableEdgeToEdge()
         setContent { SalomApp(this) }
     }
 }
 
-private class Store(context: Context) {
+internal class Store(context: Context) {
     val prefs = context.getSharedPreferences("salom_local", Context.MODE_PRIVATE)
     fun text(key: String, fallback: String = "") = prefs.getString(key, fallback) ?: fallback
     fun save(key: String, value: String) { prefs.edit().putString(key, value).apply() }
@@ -105,22 +110,23 @@ private fun SalomApp(context: Context) {
     val scheme = if (dark) darkColorScheme(primary = Yellow, onPrimary = Ink, background = Color(0xFF171816), surface = Color(0xFF232420), secondaryContainer = Color(0xFF494125))
     else lightColorScheme(primary = Yellow, onPrimary = Ink, background = Soft, surface = Color.White, onSurface = Ink, secondaryContainer = Color(0xFFFFF0B2))
     SideEffect {
-        @Suppress("DEPRECATION")
         (context as? ComponentActivity)?.window?.let { window ->
-            window.statusBarColor = if (dark) 0xFF171816.toInt() else 0xFFF5F5F3.toInt()
-            window.navigationBarColor = if (dark) 0xFF232420.toInt() else 0xFFFFFFFF.toInt()
-            window.decorView.systemUiVisibility = if (dark) 0 else View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            WindowCompat.getInsetsController(window, window.decorView).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
         }
     }
     MaterialTheme(colorScheme = scheme, typography = Typography()) {
         Surface(Modifier.fillMaxSize(), color = scheme.background) {
+          Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout)).imePadding()) {
             if (!signedIn) {
                 Welcome(store) { signedIn = true }
             } else if (activeChat != null) {
                 BackHandler { activeChat = null }
-                Conversation(activeChat!!, store) { activeChat = null }
+                Conversation(activeChat!!, store, directory) { activeChat = null }
             } else {
-                Scaffold(containerColor = scheme.background, bottomBar = {
+                Scaffold(containerColor = scheme.background, contentWindowInsets = WindowInsets(0, 0, 0, 0), bottomBar = {
                     Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp).fillMaxWidth().clip(RoundedCornerShape(28.dp)).background(scheme.surface).selectableGroup(), verticalAlignment = Alignment.CenterVertically) {
                         listOf("Чаты", "Контакты", "Настройки", "Профиль").forEachIndexed { index, title ->
                             Column(Modifier.weight(1f).heightIn(min = 56.dp).selectable(selected = tab == index, role = Role.Tab, onClick = { tab = index }).padding(vertical = 5.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
@@ -145,6 +151,7 @@ private fun SalomApp(context: Context) {
             }
         }
     }
+  }
 }
 
 @Composable
@@ -205,6 +212,19 @@ private fun Avatar(person: Person, size: Int = 46) {
 @Composable
 private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, directory: DirectoryClient, onOpenAccount: (SalomAccount) -> Unit, onOpen: (Person) -> Unit, onNew: () -> Unit, onProfile: () -> Unit) {
     var search by remember { mutableStateOf("") }
+    var remoteChats by remember { mutableStateOf<List<ConversationPreview>>(emptyList()) }
+    var inboxError by remember { mutableStateOf<String?>(null) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(directory) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isActive) {
+                try { remoteChats = directory.conversations(); inboxError = null }
+                catch (exception: CancellationException) { throw exception }
+                catch (exception: DirectoryException) { inboxError = exception.message }
+                delay(5000)
+            }
+        }
+    }
     Box(Modifier.fillMaxSize()) {
         Column {
             Header("Салом") { Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Box(Modifier.size(32.dp).clip(CircleShape).background(Yellow), contentAlignment = Alignment.Center) { Text(store.text("name", "С").take(1).uppercase(), fontSize = 14.sp, color = Ink, fontWeight = FontWeight.Bold) } } }
@@ -214,6 +234,7 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
             val visible = listOf(savedPerson)
             if (search.isNotBlank()) SmartPeopleResults(context, search, accounts, directory, onOpenAccount, onProfile)
             else LazyColumn(contentPadding = PaddingValues(bottom = 90.dp)) {
+                inboxError?.let { error -> item { Text(error, color = MaterialTheme.colorScheme.error, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) } }
                 items(visible, key = { it.id }, contentType = { "chat" }) { person ->
                     Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { onOpen(person) }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(person)
@@ -227,7 +248,18 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
                         }
                     }
                 }
-                if (search.isEmpty()) item {
+                items(remoteChats, key = { it.account.id }, contentType = { "remote_chat" }) { conversation ->
+                    val account = conversation.account
+                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { onOpenAccount(account) }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Avatar(Person(account.id, account.name, account.name.take(1).uppercase(), Color(0xFFFFE9A6), "", account.username))
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(account.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(conversation.lastText, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
+                        }
+                    }
+                }
+                if (search.isEmpty() && remoteChats.isEmpty()) item {
                     Column(Modifier.fillMaxWidth().padding(horizontal = 36.dp, vertical = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(Modifier.size(60.dp).clip(RoundedCornerShape(20.dp)).background(Yellow.copy(alpha = .18f)), contentAlignment = Alignment.Center) { NavIcon(0, MaterialTheme.colorScheme.onSurface, Modifier.size(27.dp)) }
                         Spacer(Modifier.height(16.dp))
@@ -239,58 +271,6 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
             }
         }
         FloatingActionButton(onClick = onNew, containerColor = Yellow, contentColor = Ink, shape = RoundedCornerShape(18.dp), modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).size(48.dp)) { Text("+", fontSize = 28.sp) }
-    }
-}
-
-@Composable
-private fun Conversation(person: Person, store: Store, onBack: () -> Unit) {
-    var messages by remember(person.id) { mutableStateOf(store.messages(person.id)) }
-    var draft by remember { mutableStateOf("") }
-    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
-    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(0) }
-    val darkChat = MaterialTheme.colorScheme.background.red < .5f
-    val chatColors = if (darkChat) listOf(Color(0xFF22291D), Color(0xFF1B211A)) else listOf(Color(0xFFFFF6D5), Color(0xFFF4F8E9))
-    var emojiOpen by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().background(Brush.verticalGradient(chatColors)).imePadding()) {
-        Row(Modifier.padding(horizontal = 8.dp, vertical = 5.dp).fillMaxWidth().heightIn(min = 52.dp).clip(RoundedCornerShape(28.dp)).background(MaterialTheme.colorScheme.surface).padding(horizontal = 2.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onBack), contentAlignment = Alignment.Center) { Text("‹", fontSize = 30.sp, color = MaterialTheme.colorScheme.onSurface) }
-            Avatar(person, 34); Spacer(Modifier.width(10.dp))
-            Column { Text(person.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold); Text(if (person.id == "saved") "Только для тебя" else "@${person.username}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        }
-        if (person.id != "saved") Text("Профиль найден. Отправка сообщений пока недоступна.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp), textAlign = TextAlign.Center)
-        if (messages.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
-                Text("★", color = Yellow, fontSize = 48.sp)
-                Spacer(Modifier.height(12.dp))
-                Text("Всё важное — здесь", fontWeight = FontWeight.SemiBold, fontSize = 20.sp)
-                Text("Сохраняй мысли, планы и заметки", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
-            }
-        } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom)) {
-            items(messages.asReversed()) { message ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start) {
-                    Column(Modifier.widthIn(max = 285.dp).clip(RoundedCornerShape(20.dp, 20.dp, if (message.mine) 5.dp else 20.dp, if (message.mine) 20.dp else 5.dp)).background(if (message.mine) Yellow else MaterialTheme.colorScheme.surface).padding(horizontal = 15.dp, vertical = 11.dp)) {
-                        Text(message.text, color = if (message.mine) Ink else MaterialTheme.colorScheme.onSurface, fontSize = 16.sp)
-                        if (message.time.isNotEmpty()) Text(message.time, color = Ink.copy(alpha = .58f), fontSize = 9.sp, modifier = Modifier.align(Alignment.End).padding(top = 2.dp))
-                    }
-                }
-            }
-        }
-        if (emojiOpen) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-            listOf("💛", "😊", "👍", "👋", "✨").forEach { emoji ->
-                Box(Modifier.size(48.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surface).clickable { draft += emoji; emojiOpen = false }, contentAlignment = Alignment.Center) { Text(emoji, fontSize = 24.sp) }
-            }
-        }
-        Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 5.dp), verticalAlignment = Alignment.Bottom) {
-            Row(Modifier.weight(1f).heightIn(min = 46.dp).clip(RoundedCornerShape(25.dp)).background(MaterialTheme.colorScheme.surface), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(46.dp).clickable(enabled = person.id == "saved") { emojiOpen = !emojiOpen }, contentAlignment = Alignment.Center) { Text("☺", fontSize = 25.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                BasicTextField(draft, { draft = it.take(4000) }, enabled = person.id == "saved", modifier = Modifier.weight(1f).padding(end = 12.dp, top = 11.dp, bottom = 11.dp), textStyle = androidx.compose.ui.text.TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 15.sp, lineHeight = 21.sp), cursorBrush = SolidColor(Yellow), maxLines = 5, decorationBox = { inner ->
-                    if (draft.isEmpty()) Text("Сообщение", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
-                    inner()
-                })
-            }
-            Spacer(Modifier.width(8.dp))
-            Button(onClick = { if (person.id == "saved" && draft.isNotBlank()) { val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date()); messages = messages + Message(draft.trim(), true, time); store.saveMessages(person.id, messages); draft = ""; emojiOpen = false } }, enabled = person.id == "saved" && draft.isNotBlank(), contentPadding = PaddingValues(0.dp), modifier = Modifier.size(46.dp), shape = CircleShape) { Text("↑", fontSize = 26.sp) }
-        }
     }
 }
 
@@ -364,7 +344,7 @@ private fun Settings(dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> U
                 HorizontalDivider(Modifier.padding(vertical = 18.dp))
                 Detail("На этом телефоне", "Хранение заметок")
                 Spacer(Modifier.height(20.dp))
-                Detail("0.4.0", "Версия Салом")
+                Detail("0.5.0", "Версия Салом")
             }
         }
         Spacer(Modifier.height(18.dp))

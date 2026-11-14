@@ -14,6 +14,8 @@ import java.security.SecureRandom
 import java.util.UUID
 
 internal class DirectoryException(message: String) : Exception(message)
+internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
+internal data class MessageBatch(val messages: List<Message>, val hasMore: Boolean)
 
 /** Installation credential authenticates only this public profile; phones/emails never leave the device. */
 internal class DirectoryClient(context: Context) {
@@ -24,7 +26,7 @@ internal class DirectoryClient(context: Context) {
     val ownId: String = identity.getString("device_id", null) ?: UUID.randomUUID().toString().also { identity.edit().putString("device_id", it).commit() }
     private val token: String = identity.getString("token", null) ?: ByteArray(32).also { SecureRandom().nextBytes(it) }.let { Base64.encodeToString(it, Base64.NO_WRAP or Base64.URL_SAFE or Base64.NO_PADDING) }.also { identity.edit().putString("token", it).commit() }
 
-    private fun request(path: String, body: JSONObject? = null): JSONObject {
+    private fun request(path: String, body: JSONObject? = null, method: String = if (body != null) "PUT" else "GET"): JSONObject {
         val connection = URL("https://mukimov.site/salom/api/$path").openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = 7000
@@ -33,7 +35,7 @@ internal class DirectoryClient(context: Context) {
             connection.setRequestProperty("Authorization", "Bearer $token")
             connection.setRequestProperty("Accept", "application/json")
             if (body != null) {
-                connection.requestMethod = "PUT"
+                connection.requestMethod = method
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 val data = body.toString().toByteArray(Charsets.UTF_8)
@@ -82,4 +84,27 @@ internal class DirectoryClient(context: Context) {
     }
 
     private fun account(json: JSONObject) = SalomAccount(json.getString("id"), json.getString("name"), json.optString("username"), "", json.optBoolean("is_active"))
+
+    suspend fun sendMessage(peerId: String, text: String, clientId: String): Message = withContext(Dispatchers.IO) {
+        syncLocal()
+        message(request("messages", JSONObject().put("recipient_id", peerId).put("text", text).put("client_id", clientId), "POST"))
+    }
+
+    suspend fun messages(peerId: String, after: Long): MessageBatch = withContext(Dispatchers.IO) {
+        syncLocal()
+        val result = request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8") + "&after=$after")
+        val array = result.getJSONArray("messages")
+        MessageBatch((0 until array.length()).map { message(array.getJSONObject(it)) }, result.optBoolean("has_more"))
+    }
+
+    suspend fun conversations(): List<ConversationPreview> = withContext(Dispatchers.IO) {
+        syncLocal()
+        val array = request("conversations").getJSONArray("conversations")
+        (0 until array.length()).map { val item = array.getJSONObject(it); ConversationPreview(account(item.getJSONObject("profile")), item.getString("last_text")) }
+    }
+
+    private fun message(json: JSONObject): Message {
+        val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date((json.getDouble("created") * 1000).toLong()))
+        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"))
+    }
 }

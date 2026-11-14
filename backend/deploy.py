@@ -3,6 +3,8 @@ import datetime
 import shutil
 import sqlite3
 import subprocess
+import time
+import urllib.request
 
 source = Path('/tmp/salom-api-deploy')
 assert (source / 'app.py').is_file()
@@ -27,6 +29,13 @@ shutil.copy2(source / 'salom-api.service', '/etc/systemd/system/salom-api.servic
 subprocess.run(['systemctl', 'daemon-reload'], check=True)
 subprocess.run(['systemctl', 'enable', '--now', 'salom-api'], check=True)
 subprocess.run(['systemctl', 'restart', 'salom-api'], check=True)
+for attempt in range(20):
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:18731/health', timeout=2) as response:
+            if response.status == 200: break
+    except Exception:
+        if attempt == 19: raise
+        time.sleep(0.5)
 text = config.read_text()
 if 'location ^~ /salom/api/' not in text:
     anchor = '    # Salom downloads\n'
@@ -37,12 +46,16 @@ if 'location ^~ /salom/api/' not in text:
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
-        client_max_body_size 8k;
+        client_max_body_size 64k;
         proxy_connect_timeout 3s;
         proxy_read_timeout 12s;
         add_header Cache-Control no-store;
     }
 ''' + anchor, 1)
+else:
+    start = text.index('    location ^~ /salom/api/')
+    end = text.index('\n    }', start)
+    text = text[:start] + text[start:end].replace('client_max_body_size 8k;', 'client_max_body_size 64k;') + text[end:]
 try:
     config.write_text(text)
     subprocess.run(['nginx', '-t'], check=True)
