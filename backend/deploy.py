@@ -22,7 +22,7 @@ database = Path('/var/lib/salom-api/directory.sqlite3')
 if database.exists():
     with sqlite3.connect(database) as origin, sqlite3.connect(backup / 'directory.sqlite3') as saved:
         origin.backup(saved)
-for filename in ('app.py', 'requirements.txt'):
+for filename in ('app.py', 'push.py', 'requirements.txt'):
     shutil.copy2(source / filename, destination / filename)
     (destination / filename).chmod(0o644)
 shutil.copy2(source / 'salom-api.service', '/etc/systemd/system/salom-api.service')

@@ -103,6 +103,17 @@ internal class DirectoryClient(context: Context) {
         (0 until array.length()).map { val item = array.getJSONObject(it); ConversationPreview(account(item.getJSONObject("profile")), item.getString("last_text")) }
     }
 
+    suspend fun registerPush(pushToken: String, enabled: Boolean) = withContext(Dispatchers.IO) {
+        syncLocal()
+        request("push-token", JSONObject().put("token", pushToken).put("enabled", enabled))
+        Unit
+    }
+
+    suspend fun peer(peerId: String): SalomAccount = withContext(Dispatchers.IO) {
+        syncLocal()
+        account(request("profiles/" + URLEncoder.encode(peerId, "UTF-8")))
+    }
+
     private fun message(json: JSONObject): Message {
         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date((json.getDouble("created") * 1000).toLong()))
         return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"))

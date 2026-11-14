@@ -9,7 +9,7 @@ import shutil
 import subprocess
 
 incoming = Path('/tmp/salom-deploy')
-apk = incoming / 'salom-0.5.0.apk'
+apk = incoming / 'salom-0.7.0.apk'
 assert apk.is_file() and apk.stat().st_size > 100_000
 assert (incoming / 'index.html').is_file()
 config = Path('/etc/nginx/sites-available/ryadom')
@@ -21,10 +21,18 @@ shutil.copy2(config, backup / 'nginx.conf')
 shutil.copy2(page, backup / 'index.html')
 target = Path('/var/www/salom')
 target.mkdir(parents=True, exist_ok=True)
-shutil.copy2(apk, target / apk.name)
-shutil.copy2(apk, target / 'salom-latest.apk')
-metadata = {'version': '0.5.0', 'versionCode': 7, 'minSdk': 23, 'downloadUrl': 'https://mukimov.site/salom/salom-latest.apk', 'size': apk.stat().st_size, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest()}
-(target / 'version.json').write_text(json.dumps(metadata, indent=2) + '\n')
+for filename in ('salom-latest.apk', 'version.json'):
+    if (target / filename).exists(): shutil.copy2(target / filename, backup / filename)
+sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
+if (target / apk.name).exists():
+    assert hashlib.sha256((target / apk.name).read_bytes()).hexdigest() == sha256, 'A published version must never change bytes'
+for filename in (apk.name, 'salom-latest.apk'):
+    temporary = target / (filename + '.tmp')
+    shutil.copy2(apk, temporary)
+    temporary.chmod(0o644)
+    temporary.replace(target / filename)
+metadata = {'version': '0.7.0', 'versionCode': 9, 'minSdk': 24, 'downloadUrl': 'https://mukimov.site/salom/' + apk.name, 'size': apk.stat().st_size, 'sha256': sha256,
+            'releaseNotes': ['Обновление приложения через настройки', 'Проверка актуальной версии на сервере', 'Проверка файла и подписи перед установкой']}
 for file in target.iterdir():
     if file.is_file(): file.chmod(0o644)
 new_config = config.read_text()
@@ -37,7 +45,7 @@ if marker in new_config:
 if marker not in new_config:
     routes = marker
     for filename in sorted(file.name for file in target.glob('salom-*.apk')):
-        download_name = 'salom-0.5.0.apk' if filename == 'salom-latest.apk' else filename
+        download_name = 'salom-0.7.0.apk' if filename == 'salom-latest.apk' else filename
         routes += f'''    location = /salom/{filename} {{
         alias /var/www/salom/{filename};
         default_type application/vnd.android.package-archive;
@@ -61,9 +69,16 @@ try:
     shutil.copy2(incoming / 'index.html', page)
     page.chmod(0o644)
     subprocess.run(['systemctl', 'reload', 'nginx'], check=True)
+    # Advertise the release only after its immutable APK URL is live.
+    temporary = target / 'version.json.tmp'
+    temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + '\n')
+    temporary.chmod(0o644)
+    temporary.replace(target / 'version.json')
 except Exception:
     shutil.copy2(backup / 'nginx.conf', config)
     shutil.copy2(backup / 'index.html', page)
+    for filename in ('salom-latest.apk', 'version.json'):
+        if (backup / filename).exists(): shutil.copy2(backup / filename, target / filename)
     subprocess.run(['nginx', '-t'], check=True)
     subprocess.run(['systemctl', 'reload', 'nginx'], check=True)
     raise

@@ -62,11 +62,25 @@ internal data class Message(val text: String, val mine: Boolean, val time: Strin
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
 class MainActivity : ComponentActivity() {
+    private val updater by lazy { androidx.lifecycle.ViewModelProvider(this)[AppUpdater::class.java] }
+    private var notificationPeer by mutableStateOf<String?>(null)
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        notificationPeer = intent.getStringExtra("peer_id")
         enableEdgeToEdge()
-        setContent { SalomApp(this) }
+        PushNotifications.createChannel(this)
+        setContent { SalomApp(this, updater, notificationPeer) { notificationPeer = null } }
+    }
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        notificationPeer = intent.getStringExtra("peer_id")
+    }
+    override fun onResume() {
+        super.onResume()
+        PushNotifications.sync(this)
+        updater.onResume()
     }
 }
 
@@ -90,7 +104,7 @@ internal class Store(context: Context) {
 }
 
 @Composable
-private fun SalomApp(context: Context) {
+private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: String?, onNotificationHandled: () -> Unit) {
     val store = remember { Store(context) }
     val directory = remember { DirectoryClient(context) }
     var directoryError by remember { mutableStateOf<String?>(null) }
@@ -99,6 +113,28 @@ private fun SalomApp(context: Context) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var activeChat by remember { mutableStateOf<Person?>(null) }
     var profileVersion by remember { mutableIntStateOf(0) }
+    val permission = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { PushNotifications.sync(context) }
+    LaunchedEffect(signedIn) {
+        PushNotifications.sync(context)
+        if (signedIn && android.os.Build.VERSION.SDK_INT >= 33 && store.text("notification_permission_asked") != "yes") {
+            store.save("notification_permission_asked", "yes")
+            permission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+    LaunchedEffect(notificationPeer, signedIn) {
+        if (signedIn && notificationPeer != null) {
+            try {
+                val account = directory.peer(notificationPeer)
+                tab = 0
+                activeChat = Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username)
+            } catch (exception: DirectoryException) {
+                android.widget.Toast.makeText(context, exception.message, android.widget.Toast.LENGTH_LONG).show()
+            }
+            onNotificationHandled()
+        }
+    }
     val accounts = remember(profileVersion, signedIn) { listOf(SalomAccount("self", store.text("name"), store.text("username"), store.text("phone"), is_active = signedIn)) }
     LaunchedEffect(profileVersion, signedIn) {
         if (signedIn) {
@@ -124,7 +160,9 @@ private fun SalomApp(context: Context) {
                 Welcome(store) { signedIn = true }
             } else if (activeChat != null) {
                 BackHandler { activeChat = null }
-                Conversation(activeChat!!, store, directory) { activeChat = null }
+                key(activeChat!!.id) {
+                    Conversation(activeChat!!, store, directory) { activeChat = null }
+                }
             } else {
                 Scaffold(containerColor = scheme.background, contentWindowInsets = WindowInsets(0, 0, 0, 0), bottomBar = {
                     Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp).fillMaxWidth().clip(RoundedCornerShape(28.dp)).background(scheme.surface).selectableGroup(), verticalAlignment = Alignment.CenterVertically) {
@@ -141,9 +179,15 @@ private fun SalomApp(context: Context) {
                 }) { padding ->
                     Crossfade(targetState = tab, animationSpec = tween(140), modifier = Modifier.padding(padding), label = "navigation") { page ->
                         when (page) {
-                            0 -> Chats(context, store, accounts, directory, openAccount, { activeChat = it }, { tab = 1 }, { tab = 3 })
+                            0 -> Column {
+                                val updateStatus by updater.status.collectAsState()
+                                if (updateStatus is UpdateStatus.Available || updateStatus is UpdateStatus.Ready) {
+                                    TextButton(onClick = { tab = 2 }, modifier = Modifier.fillMaxWidth()) { Text("Доступно обновление Салома →") }
+                                }
+                                Box(Modifier.weight(1f)) { Chats(context, store, accounts, directory, openAccount, { activeChat = it }, { tab = 1 }, { tab = 3 }) }
+                            }
                             1 -> PhoneContacts(context, accounts, openAccount)
-                            2 -> Settings(dark, { dark = it; store.save("dark", if (it) "yes" else "no") }, { store.save("signed_in", "no"); signedIn = false; tab = 0 })
+                            2 -> Settings(updater, dark, { dark = it; store.save("dark", if (it) "yes" else "no") }, { store.save("signed_in", "no"); signedIn = false; tab = 0 })
                             else -> Profile(store, profileVersion, directory, directoryError) { directoryError = null; profileVersion++ }
                         }
                     }
@@ -334,9 +378,10 @@ private fun Profile(store: Store, version: Int, directory: DirectoryClient, sync
 private fun Detail(value: String, label: String) { Column { Text(value, fontSize = 14.sp); Text(label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp)) } }
 
 @Composable
-private fun Settings(dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> Unit) {
+private fun Settings(updater: AppUpdater, dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> Unit) {
+    val notificationSettingsContext = androidx.compose.ui.platform.LocalContext.current
     var confirmLogout by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Header("Настройки", "Сделай Салом своим")
         Card(Modifier.padding(horizontal = 14.dp), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
             Column(Modifier.padding(16.dp)) {
@@ -344,10 +389,18 @@ private fun Settings(dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> U
                 HorizontalDivider(Modifier.padding(vertical = 18.dp))
                 Detail("На этом телефоне", "Хранение заметок")
                 Spacer(Modifier.height(20.dp))
-                Detail("0.5.0", "Версия Салом")
+                Detail(updater.installedVersion, "Версия Салом")
+                TextButton(onClick = {
+                    val settingsContext = android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, "com.mukimov.salom")
+                    // App notification settings are available from Android 8; older devices use app details.
+                    if (android.os.Build.VERSION.SDK_INT >= 26) settingsContext.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    else { settingsContext.action = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS; settingsContext.data = android.net.Uri.parse("package:com.mukimov.salom") }
+                    notificationSettingsContext.startActivity(settingsContext)
+                }) { Text("Настроить уведомления") }
             }
         }
-        Spacer(Modifier.height(18.dp))
+        UpdateCard(updater)
         TextButton(onClick = { confirmLogout = true }, modifier = Modifier.padding(horizontal = 12.dp)) { Text("Выйти из профиля", color = MaterialTheme.colorScheme.error) }
     }
     if (confirmLogout) AlertDialog(onDismissRequest = { confirmLogout = false }, title = { Text("Выйти из профиля?") }, text = { Text("Локальные сообщения останутся на этом телефоне.") }, confirmButton = { TextButton(onClick = { confirmLogout = false; onLogout() }) { Text("Выйти", color = MaterialTheme.colorScheme.error) } }, dismissButton = { TextButton(onClick = { confirmLogout = false }) { Text("Отмена", color = MaterialTheme.colorScheme.onSurface) } })

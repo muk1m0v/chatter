@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "740495426996",
+    "project_id": "strike-impact",
+    "storage_bucket": "strike-impact.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:740495426996:android:68a3aa7f93923eda26dee1",
+        "android_client_info": {
+          "package_name": "com.mukimov.salom"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyABDRmWPKwgLbEuzrJjiEvNki8JuaTuYII"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

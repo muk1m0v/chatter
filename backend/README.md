@@ -10,10 +10,18 @@ Purpose: username lookup and authenticated text conversations across Android ins
 | POST `/messages` | Registered Bearer installation key | Send to an active recipient; client UUID makes retries idempotent; 4,000 character limit |
 | GET `/messages?peer_id=UUID&after=0` | Registered Bearer installation key | Only the caller's conversation with this peer; batches of 100, ascending server IDs |
 | GET `/conversations` | Registered Bearer installation key | Up to 100 latest conversations belonging to the caller |
+| PUT `/push-token` | Registered Bearer installation key | Bind or disable the caller's FCM token; one installation per current account |
+| GET `/profiles/{id}` | Registered Bearer installation key | Resolve an active public profile for a notification's chat link |
 
 Public response fields: id, name, username, is_active. No phone, email, token or key hash is returned. The server never receives the address book.
 
-Messages are stored in SQLite and transferred over HTTPS; they are not end-to-end encrypted. Sender identity comes from the installation key, never a request-supplied sender ID. Android polls only while its screen is started; background push notifications are not implemented.
+Messages are stored in SQLite and transferred over HTTPS; they are not end-to-end encrypted. Sender identity comes from the installation key, never a request-supplied sender ID. Android polls history only while its screen is started. Version 0.6 adds FCM notifications in the background, independent of polling.
+
+Server FCM credentials live at `/etc/salom-api/firebase-admin.json`, root-owned and group-readable only by `salom-api` (0640 inside a 0750 directory). They never enter the APK or Git. Android's `google-services.json` is client configuration, not a server private key. Install the pinned Python dependencies before deploying; `push.py` is deployed alongside `app.py`.
+
+Each new message inserts an outbox row in the same SQLite transaction. The single service worker sends HTTP v1 notification+data payloads, using a one-day TTL, high priority, private lockscreen visibility and a stable per-message notification tag. Network failures retry with backoff; unregistered tokens are removed. Delivery is at least once; a stable tag replaces a repeated notification. Google acceptance is not proof of device display or reading. Existing message POST retries do not enqueue another outbox row.
+
+`test_push.py` uses an isolated temporary SQLite database and fake HTTP responses to check queue idempotency, payload routing, network retry, token removal, disable and binding isolation. `ui_push_probe.py` creates a controlled sender for physical Android tests, then removes its profile, messages and outbox rows with `cleanup`. Force-stopping an app from Android settings prevents FCM delivery until the user opens it again; ordinary backgrounding is different.
 
 `test_messaging.py` checks delivery, replies, incremental reads, retry deduplication, inbox membership and isolation from a third account through public HTTPS. `ui_messaging_probe.py create @username` creates a temporary controlled peer that replies only to the exact QA text `Salom050check`. Run its `cleanup` command after Android testing to remove that peer and cascade-delete its messages. No real user's conversation is used by these tests.
 

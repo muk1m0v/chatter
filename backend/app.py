@@ -14,6 +14,7 @@ from uuid import UUID
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from push import PushDispatcher
 
 DB = Path(os.environ.get('SALOM_DB', '/var/lib/salom-api/directory.sqlite3'))
 USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9_]{3,23}$')
@@ -45,12 +46,23 @@ def initialize():
           UNIQUE(sender_id, client_id));
         CREATE INDEX IF NOT EXISTS messages_pair ON messages(sender_id, recipient_id, id);
         CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, id);
+        CREATE TABLE IF NOT EXISTS push_tokens (
+          profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+          token TEXT NOT NULL UNIQUE, updated REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS push_jobs (
+          message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+          state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+          next_at REAL NOT NULL DEFAULT 0, last_error TEXT);
+        CREATE INDEX IF NOT EXISTS push_jobs_pending ON push_jobs(state,next_at);
         ''')
 
 @asynccontextmanager
 async def lifespan(app):
     initialize()
+    app.state.push = PushDispatcher(connect)
+    app.state.push.start()
     yield
+    app.state.push.stop()
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -93,7 +105,7 @@ class ProfileInput(BaseModel):
 @app.get('/health')
 def health():
     with connect() as db: db.execute('SELECT 1').fetchone()
-    return {'status': 'ok', 'service': 'salom-directory'}
+    return {'status': 'ok', 'service': 'salom-directory', 'push_configured': app.state.push.configured}
 
 @app.put('/profile')
 def profile(body: ProfileInput, request: Request, authorization: str | None = Header(default=None)):
@@ -176,7 +188,36 @@ def send_message(body: MessageInput, authorization: str | None = Header(default=
                 raise HTTPException(409, 'Этот идентификатор уже использован для другого сообщения')
             return message_json(existing)
         cursor = db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created) VALUES(?,?,?,?,?)', (me['id'], body.recipient_id, body.client_id, text, time.time()))
+        db.execute('INSERT INTO push_jobs(message_id) VALUES(?)', (cursor.lastrowid,))
+        app.state.push.wake.set()
         return message_json(db.execute('SELECT * FROM messages WHERE id=?', (cursor.lastrowid,)).fetchone())
+
+class PushTokenInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    token: str = Field(min_length=20, max_length=4096, pattern=r'^[A-Za-z0-9_:\-]+$')
+    enabled: bool = True
+
+@app.put('/push-token')
+def register_push(body: PushTokenInput, authorization: str | None = Header(default=None)):
+    me = current_profile(authorization)
+    with connect() as db:
+        if not body.enabled:
+            db.execute('DELETE FROM push_tokens WHERE profile_id=?', (me['id'],))
+        else:
+            try:
+                db.execute('INSERT INTO push_tokens(profile_id,token,updated) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET token=excluded.token,updated=excluded.updated',
+                           (me['id'], body.token, time.time()))
+            except sqlite3.IntegrityError:
+                raise HTTPException(409, 'Этот токен уже связан с другим профилем')
+    return {'registered': body.enabled}
+
+@app.get('/profiles/{peer_id}')
+def get_profile(peer_id: str, authorization: str | None = Header(default=None)):
+    current_profile(authorization)
+    with connect() as db:
+        row = db.execute('SELECT * FROM profiles WHERE id=? AND is_active=1', (peer_id,)).fetchone()
+        if not row: raise HTTPException(404, 'Профиль недоступен')
+        return public(row)
 
 @app.get('/messages')
 def get_messages(peer_id: str, after: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):

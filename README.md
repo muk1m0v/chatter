@@ -2,7 +2,7 @@
 
 Native Android messenger prototype with a saturated yellow accent. The repository remains named `chatter`.
 
-## Current version — 0.5.0
+## Current version — 0.7.0
 
 The `android` project contains Salom (`com.mukimov.salom`): phone/email profile entry, real device contacts with runtime permission and background loading, private Saved Messages, profile editing, and light/dark themes. Fictional contacts and demo labels were removed in 0.2.0. The default build is an R8-optimized release. See [the 0.2 notes](docs/salom-v0.2.md).
 
@@ -16,7 +16,9 @@ Version 0.4.0 connects usernames to the shared authenticated server directory, s
 
 Version 0.5.0 adds authenticated text messaging between devices and system-bar/keyboard insets throughout the app. See [0.5 scope and validation](docs/salom-v0.5.md).
 
-Public display name and username synchronize to the Salom directory. Phones, emails, address book and Saved Messages stay on the device. A private installation credential protects profile updates and message access. Messages are stored on the server and transferred over HTTPS; end-to-end encryption is not implemented. Phone/email verification, account recovery on another device, calls and background push notifications are not implemented. Device contacts are not presented as verified registered Salom users.
+Public display name and username synchronize to the Salom directory. Phones, emails, address book and Saved Messages stay on the device. A private installation credential protects profile updates and message access. Messages are stored on the server and transferred over HTTPS; end-to-end encryption is not implemented. Phone/email verification, account recovery on another device, calls are not implemented. Version 0.6.0 adds Firebase Cloud Messaging notifications, authenticated device-token registration, a durable server outbox and opening the matching chat on tap. It requires Android 7.0 or newer. See [0.6 scope and checks](docs/salom-v0.6.md). Device contacts are not presented as verified registered Salom users.
+
+Version 0.7.0 adds server-verified update status in Settings, APK download with progress, integrity/signature checks and Android installation. See [0.7 update behavior](docs/salom-v0.7.md).
 
 ## Verified development baseline
 

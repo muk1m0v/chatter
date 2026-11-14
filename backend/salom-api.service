@@ -8,6 +8,7 @@ Group=salom-api
 WorkingDirectory=/opt/salom-api
 Environment=SALOM_DB=/var/lib/salom-api/directory.sqlite3
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=GOOGLE_APPLICATION_CREDENTIALS=/etc/salom-api/firebase-admin.json
 StateDirectory=salom-api
 StateDirectoryMode=0700
 ExecStart=/opt/salom-api/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 18731 --workers 1 --limit-concurrency 32 --timeout-keep-alive 5 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1
@@ -17,7 +18,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 MemoryMax=192M
 UMask=0077
 

@@ -40,3 +40,7 @@ captures/
 *.sqlite3-*
 .DS_Store
 Thumbs.db
+# Server-only Firebase credentials never belong in the APK or repository.
+*firebase-adminsdk*.json
+firebase-admin.json
+service-account*.json
