@@ -15,6 +15,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.foundation.border
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -26,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.paint
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -52,6 +57,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.UUID
 
 @Composable
@@ -79,6 +86,8 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var confirmClear by remember { mutableStateOf(false) }
     var connectionError by remember { mutableStateOf<String?>(null) }
     var peerOnline by remember(person.id) { mutableStateOf(false) }
+    var peerTyping by remember(person.id) { mutableStateOf(false) }
+    var replyingTo by remember(person.id) { mutableStateOf<Message?>(null) }
     var pendingMessage by remember(person.id) { mutableStateOf<Message?>(null) }
     var showWallpapers by remember { mutableStateOf(false) }
     var sendError by remember { mutableStateOf<String?>(null) }
@@ -147,6 +156,8 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument(), choose)
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia(), choose)
 
+    LaunchedEffect(person.id) { if (!saved) PushNotifications.cancelChat(context, person.id) }
+
     LaunchedEffect(person.id, retry) {
         if (!saved) {
             var cursor = clearedThrough
@@ -178,6 +189,26 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             }
         }
     }
+    LaunchedEffect(person.id) {
+        if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isActive) {
+                try { peerTyping = directory.peerTyping(person.id) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { peerTyping = false }
+                delay(1500)
+            }
+        }
+    }
+    LaunchedEffect(person.id) {
+        if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            snapshotFlow { draft.isNotBlank() }.distinctUntilChanged().collectLatest { typing ->
+                if (typing) {
+                    while (true) {
+                        try { directory.setTyping(person.id, true) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { }
+                        delay(2500)
+                    }
+                } else try { directory.setTyping(person.id, false) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { }
+            }
+        }
+    }
     LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(0) }
     val send: () -> Unit = {
         val text = draft.trim()
@@ -185,11 +216,12 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         if ((text.isNotEmpty() || attachment != null) && !busy) {
             if (attachment != null && audio.activeId == attachment.id) audio.stop()
             sending = true; sendError = null; micDenied = false
-            val signature = text + ":" + attachment?.id.orEmpty()
+            val quote = replyingTo
+            val signature = text + ":" + attachment?.id.orEmpty() + ":" + (quote?.remoteId ?: 0)
             if (signature != pendingSignature || pendingId.isEmpty()) { pendingSignature = signature; pendingId = UUID.randomUUID().toString() }
             val clientId = pendingId
             val sentAt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-            if (!saved) pendingMessage = Message(text, true, sentAt, attachment = attachment, receipt = "pending")
+            if (!saved) pendingMessage = Message(text, true, sentAt, attachment = attachment, receipt = "pending", replyToId = quote?.remoteId, replyAuthor = if (quote?.mine == true) "Вы" else person.name, replyPreview = quote?.let(::replyPreview))
             scope.launch {
                 try {
                     val sent = if (saved) {
@@ -198,12 +230,12 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                         Message(text, true, time, attachment = local)
                     } else {
                         if (attachment != null && uploaded == null) uploaded = media.upload(person.id, attachment)
-                        directory.sendMessage(person.id, text, clientId, uploaded)
+                        directory.sendMessage(person.id, text, clientId, uploaded, quote?.remoteId)
                     }
                     messages = if (saved) messages + sent else (messages + sent).filter { it.remoteId > clearedThrough }.distinctBy { it.remoteId }.sortedBy { it.remoteId }
                     if (saved) store.saveMessages(person.id, messages)
                     pendingMessage = null
-                    draft = ""; selected = null; uploaded = null; pendingId = ""; pendingSignature = ""
+                    draft = ""; selected = null; uploaded = null; replyingTo = null; pendingId = ""; pendingSignature = ""
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: Exception) { sendError = (failure as? DirectoryException)?.message ?: "Не удалось отправить. Попробуй снова" }
                 finally { pendingMessage = null; sending = false }
@@ -226,7 +258,10 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 Spacer(Modifier.width(8.dp))
                 Column(Modifier.weight(1f).padding(vertical = 3.dp)) {
                     Text(person.name, fontSize = 14.sp, lineHeight = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(if (saved) "Только для тебя" else if (peerOnline) "в сети" else "не в сети", fontSize = 10.sp, lineHeight = 13.sp, maxLines = 1, color = if (peerOnline) Color(0xFF24B566) else MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (peerTyping) Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("печатает", fontSize = 10.sp, lineHeight = 13.sp, color = Color(0xFF24B566))
+                        Spacer(Modifier.width(4.dp)); TypingDots()
+                    } else Text(if (saved) "Только для тебя" else if (peerOnline) "в сети" else "не в сети", fontSize = 10.sp, lineHeight = 13.sp, maxLines = 1, color = if (peerOnline) Color(0xFF24B566) else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             Spacer(Modifier.width(4.dp))
@@ -257,7 +292,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             itemsIndexed(messages.asReversed()) { index, message ->
                 val newer = if (index > 0) messages[messages.lastIndex - index + 1] else null
                 androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
-                    ChatMessage(message, maxWidth * .82f, media, audio, newer != null && newer.mine == message.mine && newer.time == message.time)
+                    ChatMessage(message, maxWidth * .82f, media, audio, newer != null && newer.mine == message.mine && newer.time == message.time, onReply = { if (!saved) replyingTo = message }, peerName = person.name)
                 }
             }
         }
@@ -267,6 +302,16 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 if (attachment.kind == "voice") Box(Modifier.weight(1f)) { AudioBubble(attachment,audio,if (dark) Color(0xFFE1E8ED) else Ink) }
                 else Column(Modifier.weight(1f)) { Text(attachment.name,maxLines=1,overflow=TextOverflow.Ellipsis,fontSize=12.sp,lineHeight=16.sp); Text(fileSize(attachment.size),fontSize=10.sp,lineHeight=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant) }
                 ChatAction("close","Убрать вложение",enabled=!busy) { audio.stop(); scope.launch { media.removeLocal(attachment); selected=null; uploaded=null } }
+            }
+        }
+        replyingTo?.let { quote ->
+            Row(Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(chatSurface).padding(start = 10.dp, top = 5.dp, bottom = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.width(2.dp).heightIn(min = 28.dp).background(Yellow))
+                Column(Modifier.weight(1f).padding(start = 8.dp)) {
+                    Text(if (quote.mine) "Ответ себе" else "Ответ ${person.name}", fontSize = 11.sp, lineHeight = 14.sp, color = if (dark) Yellow else Color(0xFF987400), fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(replyPreview(quote), fontSize = 12.sp, lineHeight = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                ChatAction("close", "Отменить ответ") { replyingTo = null }
             }
         }
         if (preparing || clearing) LinearProgressIndicator(Modifier.fillMaxWidth(),color=Yellow)
@@ -349,6 +394,27 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
 }
 
 private fun fileSize(bytes: Long): String = if (bytes >= 1024 * 1024) String.format(java.util.Locale.getDefault(), "%.1f МБ", bytes / (1024.0 * 1024.0)) else "${(bytes + 1023) / 1024} КБ"
+
+private fun replyPreview(message: Message): String = message.text.ifBlank {
+    when {
+        message.attachment?.kind == "voice" -> "Голосовое сообщение"
+        message.attachment?.mime?.startsWith("image/") == true -> "Фото"
+        message.attachment?.mime?.startsWith("video/") == true -> "Видео"
+        message.attachment != null -> message.attachment.name
+        else -> "Сообщение"
+    }
+}
+
+@Composable
+private fun TypingDots() {
+    val transition = rememberInfiniteTransition(label = "typing-dots")
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        repeat(3) { index ->
+            val alpha by transition.animateFloat(.25f, 1f, infiniteRepeatable(tween(420, delayMillis = index * 140), RepeatMode.Reverse), label = "typing-dot-$index")
+            Box(Modifier.padding(end = 2.dp).size(3.dp).graphicsLayer { this.alpha = alpha }.clip(CircleShape).background(Color(0xFF24B566)))
+        }
+    }
+}
 
 @Composable
 internal fun AttachmentBubble(attachment: Attachment, media: MediaFiles, contentColor: Color) {

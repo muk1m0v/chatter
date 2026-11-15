@@ -20,7 +20,7 @@ def payload(token, message, sender):
         'data': {'peer_id': sender['id'], 'message_id': str(message['id'])},
         'android': {'priority': 'HIGH', 'ttl': '86400s', 'restricted_package_name': 'com.mukimov.salom',
                     'notification': {'channel_id': 'salom_messages_ding_v1', 'icon': 'ic_notification',
-                                     'color': '#FFC400', 'sound': 'salom_ding', 'tag': 'salom-' + str(message['id']),
+                    'color': '#FFC400', 'sound': 'salom_ding', 'tag': 'salom-peer-' + sender['id'],
                                      'visibility': 'PRIVATE'}},
     }}
 

@@ -60,7 +60,7 @@ internal val Yellow = Color(0xFFFFC400)
 internal val Ink = Color(0xFF25241F)
 private val Soft = Color(0xFFF5F5F3)
 internal data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "")
-internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0, val attachment: Attachment? = null, val receipt: String = "sent")
+internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0, val attachment: Attachment? = null, val receipt: String = "sent", val replyToId: Long? = null, val replyAuthor: String? = null, val replyPreview: String? = null)
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
 class MainActivity : ComponentActivity() {
@@ -81,8 +81,13 @@ class MainActivity : ComponentActivity() {
     }
     override fun onResume() {
         super.onResume()
+        getSharedPreferences("salom_local", MODE_PRIVATE).edit().putBoolean("app_visible", true).apply()
         PushNotifications.sync(this)
         updater.onResume()
+    }
+    override fun onStop() {
+        getSharedPreferences("salom_local", MODE_PRIVATE).edit().putBoolean("app_visible", false).apply()
+        super.onStop()
     }
 }
 
@@ -178,6 +183,7 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
     val scheme = if (dark) darkColorScheme(primary = Yellow, onPrimary = Ink, background = Color(0xFF171816), surface = Color(0xFF232420), secondaryContainer = Color(0xFF494125))
     else lightColorScheme(primary = Yellow, onPrimary = Ink, background = Soft, surface = Color.White, onSurface = Ink, secondaryContainer = Color(0xFFFFF0B2))
     SideEffect {
+        store.prefs.edit().putBoolean("app_visible", signedIn && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)).putString("active_peer_id", activeChat?.id?.takeUnless { it == "saved" }).apply()
         (context as? ComponentActivity)?.window?.let { window ->
             WindowCompat.getInsetsController(window, window.decorView).apply {
                 isAppearanceLightStatusBars = activeChat == null && !dark

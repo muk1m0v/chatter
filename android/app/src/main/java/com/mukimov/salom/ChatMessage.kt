@@ -1,7 +1,9 @@
 package com.mukimov.salom
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -18,17 +20,28 @@ import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun ChatMessage(message: Message, maxWidth: androidx.compose.ui.unit.Dp, media: MediaFiles, player: ChatAudioPlayer, grouped: Boolean) {
+internal fun ChatMessage(message: Message, maxWidth: androidx.compose.ui.unit.Dp, media: MediaFiles, player: ChatAudioPlayer, grouped: Boolean, onReply: (() -> Unit)? = null, peerName: String = "Собеседник") {
     val dark = MaterialTheme.colorScheme.background.red < .5f
     val textColor = if (message.mine) (if (dark) Color(0xFFFFF0BD) else Ink) else (if (dark) Color(0xFFECF1F6) else Ink)
     val bubbleColor = if (message.mine) (if (dark) Color(0xFF45452C) else Color(0xFFFFEDB2)) else (if (dark) Color(0xFF23313D) else Color.White)
     val emoji = message.attachment == null && VoicePolicy.emojiOnly(message.text)
     Row(Modifier.fillMaxWidth().padding(top = if (grouped) 1.dp else 5.dp), horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start) {
-        if (emoji) Column(horizontalAlignment = if (message.mine) Alignment.End else Alignment.Start) {
+        if (emoji) Column(Modifier.combinedClickable(enabled = onReply != null, onClick = {}, onLongClick = { onReply?.invoke() }), horizontalAlignment = if (message.mine) Alignment.End else Alignment.Start) {
             Text(message.text, fontSize = 44.sp, lineHeight = 55.sp, modifier = Modifier.padding(horizontal = 6.dp))
             if (message.time.isNotEmpty()) MessageMeta(message.time, message.receipt, message.mine, dark, Modifier.clip(RoundedCornerShape(8.dp)).background(if (dark) Color(0x30202D38) else Color(0x20FFFFFF)).padding(horizontal = 5.dp, vertical = 1.dp))
-        } else Column(Modifier.widthIn(max = maxWidth).clip(RoundedCornerShape(17.dp,17.dp,if (message.mine) 5.dp else 17.dp,if (message.mine) 17.dp else 5.dp)).background(bubbleColor).padding(horizontal=10.dp,vertical=6.dp)) {
+        } else Column(Modifier.widthIn(max = maxWidth).clip(RoundedCornerShape(17.dp,17.dp,if (message.mine) 5.dp else 17.dp,if (message.mine) 17.dp else 5.dp)).background(bubbleColor).combinedClickable(enabled = onReply != null, onClick = {}, onLongClick = { onReply?.invoke() }).padding(horizontal=10.dp,vertical=6.dp)) {
+            message.replyPreview?.let { preview ->
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp)).background(if (dark) Color.White.copy(alpha = .055f) else Color.Black.copy(alpha = .045f)).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.width(2.dp).heightIn(min = 27.dp).background(if (message.mine) Yellow else Color(0xFF4AA5E5)))
+                    Column(Modifier.weight(1f).padding(start = 7.dp, end = 4.dp)) {
+                        Text(message.replyAuthor?.takeUnless { it == "Собеседник" } ?: peerName, fontSize = 10.sp, lineHeight = 12.sp, fontWeight = FontWeight.SemiBold, color = if (message.mine) (if (dark) Yellow else Color(0xFF987400)) else Color(0xFF4AA5E5), maxLines = 1)
+                        Text(preview, fontSize = 11.sp, lineHeight = 14.sp, color = textColor.copy(alpha = .88f), maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+            }
             val attachment = message.attachment
             if (attachment != null) {
                 if (attachment.mime.startsWith("audio/")) AudioBubble(attachment, player, textColor)

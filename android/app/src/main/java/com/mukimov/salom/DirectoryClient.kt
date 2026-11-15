@@ -100,9 +100,9 @@ internal class DirectoryClient(context: Context) {
 
     private fun account(json: JSONObject) = SalomAccount(json.getString("id"), json.getString("name"), json.optString("username"), "", json.optBoolean("is_active"))
 
-    suspend fun sendMessage(peerId: String, text: String, clientId: String, attachment: Attachment? = null): Message = withContext(Dispatchers.IO) {
+    suspend fun sendMessage(peerId: String, text: String, clientId: String, attachment: Attachment? = null, replyToId: Long? = null): Message = withContext(Dispatchers.IO) {
         syncLocal()
-        message(request("messages", JSONObject().put("recipient_id", peerId).put("text", text).put("client_id", clientId).apply { attachment?.let { put("attachment_id", it.id) } }, "POST"))
+        message(request("messages", JSONObject().put("recipient_id", peerId).put("text", text).put("client_id", clientId).apply { attachment?.let { put("attachment_id", it.id) }; replyToId?.let { put("reply_to_id", it) } }, "POST"))
     }
 
     suspend fun heartbeat() = withContext(Dispatchers.IO) {
@@ -111,6 +111,14 @@ internal class DirectoryClient(context: Context) {
 
     suspend fun peerOnline(peerId: String): Boolean = withContext(Dispatchers.IO) {
         syncLocal(); request("profiles/" + URLEncoder.encode(peerId, "UTF-8")).optBoolean("is_online")
+    }
+
+    suspend fun setTyping(peerId: String, typing: Boolean) = withContext(Dispatchers.IO) {
+        syncLocal(); request("typing", JSONObject().put("peer_id", peerId).put("typing", typing), "POST"); Unit
+    }
+
+    suspend fun peerTyping(peerId: String): Boolean = withContext(Dispatchers.IO) {
+        syncLocal(); request("typing?peer_id=" + URLEncoder.encode(peerId, "UTF-8")).optBoolean("typing")
     }
 
     suspend fun messages(peerId: String, after: Long, receiptsAfter: Long = 0): MessageBatch = withContext(Dispatchers.IO) {
@@ -187,6 +195,8 @@ internal class DirectoryClient(context: Context) {
 
     private fun message(json: JSONObject): Message {
         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date((json.getDouble("created") * 1000).toLong()))
-        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"), json.optJSONObject("attachment")?.let { Attachment.from(it) }, json.optString("receipt", "sent"))
+        val quote = json.optJSONObject("reply_to")
+        val quoteSender = quote?.optString("sender_id")
+        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"), json.optJSONObject("attachment")?.let { Attachment.from(it) }, json.optString("receipt", "sent"), quote?.optLong("id")?.takeIf { it > 0 }, quoteSender?.let { if (it == ownId) "Вы" else "Собеседник" }, quote?.optString("text"))
     }
 }

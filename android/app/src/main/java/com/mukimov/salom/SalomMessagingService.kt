@@ -21,20 +21,20 @@ import kotlin.coroutines.resume
 
 internal object PushNotifications {
     const val CHANNEL = "salom_messages_ding_v1"
+    const val SILENT_CHANNEL = "salom_messages_silent_v1"
     private const val LEGACY_CHANNEL = "salom_messages"
     fun soundUri(context: Context): android.net.Uri = android.net.Uri.parse(
         "android.resource://${context.packageName}/raw/${context.resources.getResourceEntryName(R.raw.salom_ding)}")
     fun createChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= 26) {
             val manager = context.getSystemService(NotificationManager::class.java)
-            if (manager.getNotificationChannel(CHANNEL) != null) return
             val previous = manager.getNotificationChannel(LEGACY_CHANNEL)
             val sound = when {
                 previous != null && previous.sound == null -> null
                 Build.VERSION.SDK_INT >= 30 && previous?.hasUserSetSound() == true -> previous.sound
                 else -> soundUri(context)
             }
-            manager.createNotificationChannel(
+            if (manager.getNotificationChannel(CHANNEL) == null) manager.createNotificationChannel(
                 NotificationChannel(CHANNEL, "Сообщения Салом", previous?.importance ?: NotificationManager.IMPORTANCE_HIGH).apply {
                     description = "Новые сообщения · звук Салом"
                     lockscreenVisibility = android.app.Notification.VISIBILITY_PRIVATE
@@ -44,10 +44,22 @@ internal object PushNotifications {
                     previous?.let { vibrationPattern = it.vibrationPattern; enableVibration(it.shouldVibrate()) }
                 }
             )
+            if (manager.getNotificationChannel(SILENT_CHANNEL) == null) manager.createNotificationChannel(
+                NotificationChannel(SILENT_CHANNEL, "Тихие сообщения в приложении", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                    description = "Сообщения, когда Салом открыто в другом разделе"
+                    lockscreenVisibility = android.app.Notification.VISIBILITY_PRIVATE
+                    setSound(null, null)
+                    enableVibration(false)
+                }
+            )
         }
     }
     fun allowed(context: Context) = NotificationManagerCompat.from(context).areNotificationsEnabled() &&
         (Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+
+    fun cancelChat(context: Context, peerId: String) {
+        NotificationManagerCompat.from(context).cancel("salom-peer-$peerId", 0)
+    }
 
     fun sync(context: Context) {
         createChannel(context)
@@ -81,10 +93,18 @@ class SalomMessagingService : FirebaseMessagingService() {
     override fun onNewToken(token: String) { PushNotifications.sync(this) }
 
     override fun onMessageReceived(message: RemoteMessage) {
-        if (getSharedPreferences("salom_local", MODE_PRIVATE).getString("signed_in", "") != "yes") return
+        val local = getSharedPreferences("salom_local", MODE_PRIVATE)
+        if (local.getString("signed_in", "") != "yes") return
         if (!PushNotifications.allowed(this)) return
         val peerId = message.data["peer_id"] ?: return
         val messageId = message.data["message_id"] ?: return
+        val manager = NotificationManagerCompat.from(this)
+        val appVisible = local.getBoolean("app_visible", false)
+        val activePeer = local.getString("active_peer_id", null)
+        if (appVisible && activePeer == peerId) {
+            manager.cancel("salom-peer-$peerId", 0)
+            return
+        }
         PushNotifications.createChannel(this)
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -94,13 +114,14 @@ class SalomMessagingService : FirebaseMessagingService() {
         val pending = PendingIntent.getActivity(this, peerId.hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val title = message.notification?.title ?: "Салом"
         val body = message.notification?.body ?: "Новое сообщение"
-        val notification = NotificationCompat.Builder(this, PushNotifications.CHANNEL)
+        val silent = appVisible
+        val notification = NotificationCompat.Builder(this, if (silent) PushNotifications.SILENT_CHANNEL else PushNotifications.CHANNEL)
             .setSmallIcon(R.drawable.ic_notification).setColor(0xFFFFC400.toInt())
             .setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setContentIntent(pending).setAutoCancel(true).setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setSound(PushNotifications.soundUri(this))
-            .setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).build()
-        try { NotificationManagerCompat.from(this).notify("salom-$messageId", 0, notification) }
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+        if (Build.VERSION.SDK_INT < 26) notification.setSound(if (silent) null else PushNotifications.soundUri(this)).setPriority(if (silent) NotificationCompat.PRIORITY_DEFAULT else NotificationCompat.PRIORITY_HIGH)
+        try { manager.notify("salom-peer-$peerId", 0, notification.build()) }
         catch (_: SecurityException) { /* Permission can be revoked between checking and posting. */ }
     }
 }

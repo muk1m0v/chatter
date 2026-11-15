@@ -38,7 +38,8 @@ def initialize():
         CREATE TABLE IF NOT EXISTS profiles (
           id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
           username TEXT, username_key TEXT UNIQUE, is_active INTEGER NOT NULL DEFAULT 1,
-          created REAL NOT NULL, updated REAL NOT NULL, online_at REAL NOT NULL DEFAULT 0);
+          created REAL NOT NULL, updated REAL NOT NULL, online_at REAL NOT NULL DEFAULT 0,
+          typing_to TEXT, typing_at REAL NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS registrations (ip TEXT NOT NULL, at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS registrations_ip ON registrations(ip, at);
         CREATE TABLE IF NOT EXISTS messages (
@@ -46,7 +47,7 @@ def initialize():
           sender_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
           recipient_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
           client_id TEXT NOT NULL, text TEXT NOT NULL, created REAL NOT NULL,
-          delivered_at REAL, read_at REAL,
+          delivered_at REAL, read_at REAL, reply_to_id INTEGER,
           UNIQUE(sender_id, client_id));
         CREATE INDEX IF NOT EXISTS messages_pair ON messages(sender_id, recipient_id, id);
         CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, id);
@@ -61,9 +62,12 @@ def initialize():
         ''')
         profile_columns = {row['name'] for row in db.execute('PRAGMA table_info(profiles)')}
         if 'online_at' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN online_at REAL NOT NULL DEFAULT 0')
+        if 'typing_to' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN typing_to TEXT')
+        if 'typing_at' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN typing_at REAL NOT NULL DEFAULT 0')
         message_columns = {row['name'] for row in db.execute('PRAGMA table_info(messages)')}
         if 'delivered_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN delivered_at REAL')
         if 'read_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN read_at REAL')
+        if 'reply_to_id' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER')
         auth_schema(db)
         media.schema(db)
 
@@ -184,7 +188,13 @@ media.install_routes(app, connect, current_profile)
 
 def message_json(row, db):
     receipt = 'read' if row['read_at'] else 'delivered' if row['delivered_at'] else 'sent'
-    return {**{key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}, 'receipt': receipt, 'attachment': media.metadata(db, row['attachment_id'])}
+    reply = None
+    if row['reply_to_id']:
+        ref = db.execute('SELECT m.id,m.sender_id,m.text,m.attachment_id,a.kind,a.name FROM messages m LEFT JOIN attachments a ON a.id=m.attachment_id WHERE m.id=?', (row['reply_to_id'],)).fetchone()
+        if ref:
+            preview = ref['text'] or ('Фото' if ref['kind'] == 'image' else 'Видео' if ref['kind'] == 'video' else 'Голосовое сообщение' if ref['kind'] == 'voice' else ref['name'] or 'Вложение')
+            reply = {'id': ref['id'], 'sender_id': ref['sender_id'], 'text': preview[:300]}
+    return {**{key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}, 'receipt': receipt, 'attachment': media.metadata(db, row['attachment_id']), 'reply_to': reply}
 
 class MessageInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -192,6 +202,7 @@ class MessageInput(BaseModel):
     client_id: str = Field(min_length=36, max_length=36)
     text: str = Field(default='', max_length=4000)
     attachment_id: str | None = Field(default=None, min_length=36, max_length=36)
+    reply_to_id: int | None = Field(default=None, ge=1)
 
 @app.post('/messages')
 def send_message(body: MessageInput, authorization: str | None = Header(default=None)):
@@ -207,16 +218,22 @@ def send_message(body: MessageInput, authorization: str | None = Header(default=
         db.execute('BEGIN IMMEDIATE')
         if not db.execute('SELECT id FROM profiles WHERE id=? AND is_active=1', (body.recipient_id,)).fetchone():
             raise HTTPException(404, 'Получатель недоступен')
+        if body.reply_to_id is not None:
+            cleared = media.cutoff(db, me['id'], body.recipient_id)
+            reference = db.execute('''SELECT id FROM messages WHERE id>? AND id=? AND
+              ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))''',
+              (cleared, body.reply_to_id, me['id'], body.recipient_id, body.recipient_id, me['id'])).fetchone()
+            if not reference: raise HTTPException(400, 'Сообщение для ответа недоступно')
         existing = db.execute('SELECT * FROM messages WHERE sender_id=? AND client_id=?', (me['id'], body.client_id)).fetchone()
         if existing:
-            if existing['recipient_id'] != body.recipient_id or existing['text'] != text or existing['attachment_id'] != body.attachment_id:
+            if existing['recipient_id'] != body.recipient_id or existing['text'] != text or existing['attachment_id'] != body.attachment_id or existing['reply_to_id'] != body.reply_to_id:
                 raise HTTPException(409, 'Этот идентификатор уже использован для другого сообщения')
             return message_json(existing, db)
         if body.attachment_id:
             attachment = db.execute('SELECT * FROM attachments WHERE id=? AND owner_id=? AND peer_id=? AND ready=1', (body.attachment_id, me['id'], body.recipient_id)).fetchone()
             if not attachment: raise HTTPException(400, 'Вложение недоступно')
             if db.execute('SELECT 1 FROM messages WHERE attachment_id=?', (body.attachment_id,)).fetchone(): raise HTTPException(409, 'Вложение уже отправлено')
-        cursor = db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created,attachment_id) VALUES(?,?,?,?,?,?)', (me['id'], body.recipient_id, body.client_id, text, time.time(), body.attachment_id))
+        cursor = db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created,attachment_id,reply_to_id) VALUES(?,?,?,?,?,?,?)', (me['id'], body.recipient_id, body.client_id, text, time.time(), body.attachment_id, body.reply_to_id))
         db.execute('INSERT INTO push_jobs(message_id) VALUES(?)', (cursor.lastrowid,))
         app.state.push.wake.set()
         return message_json(db.execute('SELECT * FROM messages WHERE id=?', (cursor.lastrowid,)).fetchone(), db)
@@ -255,6 +272,32 @@ def heartbeat(authorization: str | None = Header(default=None)):
     with connect() as db:
         db.execute('UPDATE profiles SET online_at=? WHERE id=?', (now, me['id']))
     return {'online': True, 'at': now}
+
+class TypingInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    peer_id: str = Field(min_length=36, max_length=36)
+    typing: bool
+
+@app.post('/typing')
+def set_typing(body: TypingInput, authorization: str | None = Header(default=None)):
+    me = current_profile(authorization)
+    try: UUID(body.peer_id)
+    except ValueError: raise HTTPException(400, 'Неверный собеседник')
+    if body.peer_id == me['id']: raise HTTPException(400, 'Нельзя печатать самому себе')
+    with connect() as db:
+        if body.typing and not db.execute('SELECT 1 FROM profiles WHERE id=? AND is_active=1', (body.peer_id,)).fetchone():
+            raise HTTPException(404, 'Собеседник недоступен')
+        db.execute('UPDATE profiles SET typing_to=?,typing_at=? WHERE id=?', (body.peer_id if body.typing else None, time.time() if body.typing else 0, me['id']))
+    return {'typing': body.typing}
+
+@app.get('/typing')
+def get_typing(peer_id: str, authorization: str | None = Header(default=None)):
+    me = current_profile(authorization)
+    try: UUID(peer_id)
+    except ValueError: raise HTTPException(400, 'Неверный собеседник')
+    with connect() as db:
+        row = db.execute('SELECT typing_to,typing_at FROM profiles WHERE id=? AND is_active=1', (peer_id,)).fetchone()
+        return {'typing': bool(row and row['typing_to'] == me['id'] and row['typing_at'] >= time.time() - 6)}
 
 @app.get('/messages')
 def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_after: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
