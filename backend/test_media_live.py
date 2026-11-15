@@ -43,10 +43,26 @@ try:
         assert status==200 and hashlib.sha256(received).digest()==hashlib.sha256(data).digest()
         assert call('attachments/'+attachment['id'],index=2,binary=True)[0]==404
     print('HTTPS_PHOTO_AND_LARGE_FILE_ROUND_TRIP_AND_PRIVATE_ACCESS=PASS')
+    # Synthetic transport fixture, not a decoded microphone recording.
+    voice_bytes = b'Salom synthetic voice transport fixture'
+    voice_query = urllib.parse.urlencode({'peer_id':accounts[1]['id'],'name':'voice-qa.m4a','kind':'voice','duration_ms':2400,'waveform':'0,12,55,100,22,0'})
+    status,voice = call('attachments?'+voice_query,body=voice_bytes,mime='audio/mp4')
+    assert status==200,(status,voice)
+    attachments.append(voice['id'])
+    status,sent=call('messages',body={'recipient_id':accounts[1]['id'],'client_id':str(uuid.uuid4()),'attachment_id':voice['id'],'text':''})
+    assert status==200
+    last=sent['id']
+    received=call('messages?peer_id='+accounts[0]['id'],index=1)[1]['messages'][-1]['attachment']
+    assert received['kind']=='voice' and received['duration_ms']==2400 and received['waveform']==[0,12,55,100,22,0]
+    assert call('attachments/'+voice['id'],index=1,binary=True)[1]==voice_bytes
+    assert call('attachments/'+voice['id'],index=2,binary=True)[0]==404
+    assert call('conversations',index=1)[1]['conversations'][0]['last_text']=='Голосовое сообщение'
+    print('HTTPS_VOICE_METADATA_BYTES_PRIVATE_ACCESS_AND_CHAT_PREVIEW=PASS')
+
     peer=accounts[1]['id']
     status,cleared=call('messages?peer_id='+peer,method='DELETE'); assert status==200 and cleared['cleared_through']==last
     assert call('messages?peer_id='+peer)[1]['messages']==[]
-    assert len(call('messages?peer_id='+accounts[0]['id'],index=1)[1]['messages'])==2
+    assert len(call('messages?peer_id='+accounts[0]['id'],index=1)[1]['messages'])==3
     assert call('attachments/'+attachments[0],binary=True)[0]==404
     assert call('attachments/'+attachments[0],index=1,binary=True)[0]==200
     body={'recipient_id':accounts[0]['id'],'client_id':str(uuid.uuid4()),'text':'QA after clear'}

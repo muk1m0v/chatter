@@ -143,7 +143,7 @@ internal class DirectoryClient(context: Context) {
         throw DirectoryException(detail.ifBlank { "Не удалось передать файл. Попробуй снова" }, connection.responseCode)
     }
     internal fun uploadAttachment(peer: String, attachment: Attachment, file: java.io.File): Attachment {
-        val connection = mediaConnection("attachments?peer_id=" + URLEncoder.encode(peer, "UTF-8") + "&name=" + URLEncoder.encode(attachment.name, "UTF-8"))
+        val connection = mediaConnection("attachments?peer_id=" + URLEncoder.encode(peer, "UTF-8") + "&name=" + URLEncoder.encode(attachment.name, "UTF-8") + "&kind=" + attachment.kind + "&duration_ms=" + attachment.durationMs + "&waveform=" + URLEncoder.encode(attachment.waveform.joinToString(","), "UTF-8"))
         try {
             connection.requestMethod = "POST"; connection.doOutput = true
             connection.setRequestProperty("Content-Type", attachment.mime)

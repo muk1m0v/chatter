@@ -14,10 +14,10 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
-internal data class Attachment(val id: String, val name: String, val mime: String, val size: Long, val local: Boolean = false) {
-    fun json() = JSONObject().put("id", id).put("name", name).put("mime", mime).put("size", size).put("local", local)
+internal data class Attachment(val id: String, val name: String, val mime: String, val size: Long, val local: Boolean = false, val kind: String = "file", val durationMs: Long = 0, val waveform: List<Int> = emptyList()) {
+    fun json() = JSONObject().put("id", id).put("name", name).put("mime", mime).put("size", size).put("local", local).put("kind", kind).put("duration_ms", durationMs).put("waveform", org.json.JSONArray(waveform))
     companion object {
-        fun from(json: JSONObject) = Attachment(json.getString("id"), json.getString("name"), json.getString("mime"), json.getLong("size"), json.optBoolean("local"))
+        fun from(json: JSONObject) = Attachment(json.getString("id"), json.getString("name"), json.getString("mime"), json.getLong("size"), json.optBoolean("local"), json.optString("kind", "file"), json.optLong("duration_ms"), json.optJSONArray("waveform")?.let { array -> (0 until array.length()).map { array.optInt(it).coerceIn(0, 100) }.take(32) }.orEmpty())
     }
 }
 internal class MediaFiles(private val context: Context, private val directory: DirectoryClient) {
@@ -26,6 +26,11 @@ internal class MediaFiles(private val context: Context, private val directory: D
         require(runCatching { UUID.fromString(attachment.id) }.isSuccess)
         val base = if (attachment.local) context.filesDir else context.cacheDir
         return File(base, "media/${directory.ownId}/${attachment.id}").also { it.parentFile!!.mkdirs() }
+    }
+    internal fun newVoiceFile(): Pair<Attachment, File> {
+        val id = UUID.randomUUID().toString()
+        val attachment = Attachment(id, "voice_$id.m4a", "audio/mp4", 0, kind = "voice")
+        return attachment to target(attachment).also { trimCache(it) }
     }
     private fun trimCache(keep: File) {
         val files = keep.parentFile?.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") }.orEmpty()

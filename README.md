@@ -2,7 +2,7 @@
 
 Native Android messenger prototype with a saturated yellow accent. The repository remains named `chatter`.
 
-## Current version — 0.10.1
+## Current version — 0.11.0
 
 The `android` project contains Salom (`com.mukimov.salom`): Google sign-in and a unique username, real device contacts with runtime permission and background loading, private Saved Messages, profile editing, and light/dark themes. Fictional contacts and demo labels were removed in 0.2.0. The default build is an R8-optimized release. See [the 0.2 notes](docs/salom-v0.2.md).
 
@@ -25,6 +25,8 @@ Version 0.9.0 replaces registration forms with one native Google sign-in button.
 Version 0.10.0 adds compact chat controls, real photo/video/file attachments and per-user clear history. See [attachment limits and checks](docs/salom-v0.10.md).
 
 Version 0.10.1 adds the supplied notification sound for foreground and background messages. See [sound migration and checks](docs/salom-v0.10.1.md).
+
+Version 0.11.0 refreshes the native chat and adds explicit voice recording, draft playback and an inline audio player. See [voice behavior and manual device checks](docs/salom-v0.11.md).
 
 ## Verified development baseline
 

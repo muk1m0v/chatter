@@ -10,6 +10,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.border
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -19,6 +23,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -50,6 +55,14 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     val saved = person.id == "saved"
     val context = LocalContext.current
     val media = remember(directory) { MediaFiles(context, directory) }
+    val audio = remember(media) { ChatAudioPlayer(context, media) }
+    val recorder = remember(media) { VoiceRecorder(context, media) }
+    var recording by remember { mutableStateOf(false) }
+    var startingVoice by remember { mutableStateOf(false) }
+    var voiceGeneration by remember { mutableIntStateOf(0) }
+    var recordTime by remember { mutableLongStateOf(0) }
+    var liveLevels by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var micDenied by remember { mutableStateOf(false) }
     var messages by remember(person.id) { mutableStateOf(if (saved) store.messages(person.id) else emptyList()) }
     var draft by remember(person.id) { mutableStateOf("") }
     var selected by remember { mutableStateOf<Attachment?>(null) }
@@ -70,10 +83,52 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     val scope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val listState = rememberLazyListState()
-    val busy = sending || preparing || clearing
+    val busy = sending || preparing || clearing || recording || startingVoice
+    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    fun cancelVoice() { voiceGeneration++; recorder.cancel(); recording = false; startingVoice = false; recordTime = 0; liveLevels = emptyList() }
+    fun startVoice() {
+        if (busy || draft.isNotBlank() || selected != null) return
+        audio.stop(); focusManager.clearFocus(); keyboard?.hide(); sendError = null; micDenied = false
+        startingVoice = true; voiceGeneration++; val ticket = voiceGeneration
+        scope.launch {
+            try {
+                recorder.start()
+                if (ticket == voiceGeneration && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) { recording = true; recordTime = 0; liveLevels = emptyList() }
+                else recorder.cancel()
+            } catch (cancelled: CancellationException) { recorder.cancel(); throw cancelled }
+            catch (failure: Exception) { sendError = failure.message ?: "Не удалось начать запись" }
+            finally { startingVoice = false }
+        }
+    }
+    fun finishVoice() {
+        if (!recording) return
+        recording = false; preparing = true
+        scope.launch {
+            try { selected = recorder.finish(); uploaded = null; sendError = null }
+            catch (cancelled: CancellationException) { recorder.cancel(); throw cancelled }
+            catch (failure: Exception) { sendError = failure.message ?: "Не удалось сохранить запись" }
+            finally { preparing = false; liveLevels = emptyList() }
+        }
+    }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startVoice() else { micDenied = true; sendError = "Для голосовых сообщений разреши доступ к микрофону" }
+    }
+    DisposableEffect(lifecycle, recorder, audio) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_STOP) { cancelVoice(); audio.stop() } }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer); cancelVoice(); audio.stop() }
+    }
+    androidx.activity.compose.BackHandler(recording || startingVoice) { cancelVoice() }
+    LaunchedEffect(recording) {
+        while (recording) {
+            delay(120); recordTime = recorder.elapsed(); liveLevels = (liveLevels.takeLast(31) + recorder.sample())
+            if (recordTime >= VoicePolicy.MAX_MS || recorder.reachedLimit) { finishVoice(); break }
+        }
+    }
     val choose: (android.net.Uri?) -> Unit = { uri ->
         if (uri != null) {
-            preparing = true; sendError = null
+            preparing = true; sendError = null; micDenied = false
             scope.launch {
                 try { val prepared = media.prepare(uri); selected?.let { media.removeLocal(it) }; selected = prepared; uploaded = null }
                 catch (cancelled: CancellationException) { throw cancelled }
@@ -111,7 +166,8 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         val text = draft.trim()
         val attachment = selected
         if ((text.isNotEmpty() || attachment != null) && !busy) {
-            sending = true; sendError = null
+            if (attachment != null && audio.activeId == attachment.id) audio.stop()
+            sending = true; sendError = null; micDenied = false
             val signature = text + ":" + attachment?.id.orEmpty()
             if (signature != pendingSignature || pendingId.isEmpty()) { pendingSignature = signature; pendingId = UUID.randomUUID().toString() }
             val clientId = pendingId
@@ -135,10 +191,13 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         }
     }
     val dark = MaterialTheme.colorScheme.background.red < .5f
-    val background = if (dark) listOf(Color(0xFF22291D), Color(0xFF1B211A)) else listOf(Color(0xFFFFF6D5), Color(0xFFF4F8E9))
-    Column(Modifier.fillMaxSize().background(Brush.verticalGradient(background))) {
-        Row(Modifier.padding(horizontal = 6.dp, vertical = 4.dp).fillMaxWidth().heightIn(min = 40.dp).clip(RoundedCornerShape(23.dp)).background(MaterialTheme.colorScheme.surface), verticalAlignment = Alignment.CenterVertically) {
-            ChatAction("back", "Назад", onClick = onBack)
+    val background = if (dark) listOf(Color(0xFF111D27), Color(0xFF17232B)) else listOf(Color(0xFFF2F0E6), Color(0xFFECEEE6))
+    val wallpaper = remember(dark) { Modifier.chatWallpaper(dark) }
+    val chatBackground = remember(dark) { Brush.verticalGradient(background) }
+    val chatSurface = if (dark) Color(0xFF23303D) else Color.White
+    Column(Modifier.fillMaxSize().background(chatBackground).then(wallpaper)) {
+        Row(Modifier.padding(horizontal = 6.dp, vertical = 4.dp).fillMaxWidth().heightIn(min = 40.dp).clip(RoundedCornerShape(23.dp)).background(chatSurface), verticalAlignment = Alignment.CenterVertically) {
+            ChatAction("back", "Назад", onClick = { if (recording || startingVoice) cancelVoice() else onBack() })
             Box(Modifier.size(30.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) { Text(person.initials, color = Ink, fontWeight = FontWeight.Medium, fontSize = 14.sp) }
             Spacer(Modifier.width(8.dp))
             Column(Modifier.weight(1f).padding(vertical = 3.dp)) {
@@ -155,7 +214,10 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         val error = sendError ?: connectionError
         if (error != null) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(error, color = MaterialTheme.colorScheme.error, fontSize = 11.sp, modifier = Modifier.weight(1f))
-            TextButton(onClick = { sendError = null; retry++ }) { Text("Повторить", fontSize = 11.sp) }
+            TextButton(onClick = {
+                if (micDenied) context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:" + context.packageName)))
+                else { sendError = null; retry++ }
+            }) { Text(if (micDenied) "Настройки" else "Повторить", fontSize = 11.sp) }
         }
         if (messages.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             if (loading) CircularProgressIndicator(Modifier.size(24.dp), color = Yellow, strokeWidth = 2.dp)
@@ -163,50 +225,70 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 Text(if (saved) "Избранное" else "Начни с «Салом»", fontSize = 18.sp, fontWeight = FontWeight.Medium)
                 Text(if (saved) "Сообщения и файлы для себя" else "Напиши сообщение или отправь фото", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp))
             }
-        } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(5.dp, Alignment.Bottom)) {
-            items(messages.asReversed()) { message ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start) {
-                    Column(Modifier.widthIn(max = 280.dp).clip(RoundedCornerShape(16.dp, 16.dp, if (message.mine) 4.dp else 16.dp, if (message.mine) 16.dp else 4.dp)).background(if (message.mine) Yellow else MaterialTheme.colorScheme.surface).padding(horizontal = 10.dp, vertical = 6.dp)) {
-                        message.attachment?.let { AttachmentBubble(it, media, message.mine) }
-                        if (message.text.isNotEmpty()) Text(message.text, color = if (message.mine) Ink else MaterialTheme.colorScheme.onSurface, fontSize = 15.sp, lineHeight = 20.sp)
-                        if (message.time.isNotEmpty()) Text(message.time, color = if (message.mine) Ink.copy(alpha = .58f) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 9.sp, lineHeight = 11.sp, modifier = Modifier.align(Alignment.End).padding(top = 2.dp))
-                    }
+        } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.Bottom)) {
+            itemsIndexed(messages.asReversed()) { index, message ->
+                val newer = if (index > 0) messages[messages.lastIndex - index + 1] else null
+                androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
+                    ChatMessage(message, maxWidth * .82f, media, audio, newer != null && newer.mine == message.mine && newer.time == message.time)
                 }
             }
         }
+
         selected?.let { attachment ->
-            Row(Modifier.padding(horizontal = 8.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.surface).padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) { Text(attachment.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp, lineHeight = 16.sp); Text(fileSize(attachment.size), fontSize = 10.sp, lineHeight = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                ChatAction("close", "Убрать вложение", enabled = !busy) { scope.launch { media.removeLocal(attachment); selected = null; uploaded = null } }
+            Row(Modifier.padding(horizontal=8.dp,vertical=3.dp).fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(chatSurface).padding(start=12.dp,top=5.dp,bottom=5.dp), verticalAlignment=Alignment.CenterVertically) {
+                if (attachment.kind == "voice") Box(Modifier.weight(1f)) { AudioBubble(attachment,audio,if (dark) Color(0xFFE1E8ED) else Ink) }
+                else Column(Modifier.weight(1f)) { Text(attachment.name,maxLines=1,overflow=TextOverflow.Ellipsis,fontSize=12.sp,lineHeight=16.sp); Text(fileSize(attachment.size),fontSize=10.sp,lineHeight=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant) }
+                ChatAction("close","Убрать вложение",enabled=!busy) { audio.stop(); scope.launch { media.removeLocal(attachment); selected=null; uploaded=null } }
             }
         }
-        if (preparing || clearing) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Yellow)
-        Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp), verticalAlignment = Alignment.Bottom) {
-            Row(Modifier.weight(1f).heightIn(min = 36.dp).clip(RoundedCornerShape(20.dp)).background(MaterialTheme.colorScheme.surface).padding(start = 13.dp), verticalAlignment = Alignment.CenterVertically) {
-                BasicTextField(draft, { draft = it.take(4000) }, enabled = !busy, modifier = Modifier.weight(1f).padding(vertical = 8.dp), textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp, lineHeight = 18.sp), cursorBrush = SolidColor(Yellow), maxLines = 4, decorationBox = { inner ->
-                    if (draft.isEmpty()) Text(if (selected == null) "Сообщение" else "Подпись", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp, lineHeight = 18.sp)
-                    inner()
-                })
-                Box {
-                    ChatAction("attach", "Прикрепить файл", enabled = !busy, compact = true) { attachmentsMenu = true }
-                    DropdownMenu(attachmentsMenu, onDismissRequest = { attachmentsMenu = false }) {
-                        DropdownMenuItem(text = { Text("Фото и видео") }, onClick = { attachmentsMenu = false; pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) })
-                        DropdownMenuItem(text = { Text("Файл") }, onClick = { attachmentsMenu = false; pickFile.launch(arrayOf("*/*")) })
-                        Text("До 25 МБ", modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (preparing || clearing) LinearProgressIndicator(Modifier.fillMaxWidth(),color=Yellow)
+        Row(Modifier.fillMaxWidth().padding(horizontal=7.dp,vertical=6.dp),verticalAlignment=Alignment.Bottom) {
+            val inputShape=RoundedCornerShape(24.dp)
+            Row(Modifier.weight(1f).heightIn(min=42.dp).clip(inputShape).background(chatSurface)
+                .border(.7.dp,if (dark) Color.White.copy(alpha=.09f) else Color.Black.copy(alpha=.07f),inputShape)
+                .padding(start=if(recording) 0.dp else 14.dp),verticalAlignment=Alignment.CenterVertically) {
+                if (recording) {
+                    ChatAction("close","Отменить запись",compact=true) { cancelVoice() }
+                    Box(Modifier.size(6.dp).clip(CircleShape).background(Color(0xFFE46B64)))
+                    Text(audioTime(recordTime),fontSize=14.sp,lineHeight=18.sp,modifier=Modifier.padding(horizontal=8.dp),color=if(dark) Color.White else Ink)
+                    Waveform(liveLevels,0f,Yellow,Modifier.weight(1f).height(26.dp).padding(end=12.dp))
+                } else {
+                    BasicTextField(draft,{draft=it.take(4000)},enabled=!busy,modifier=Modifier.weight(1f).padding(vertical=8.dp),textStyle=TextStyle(color=if(dark) Color(0xFFEEF2F5) else Ink,fontSize=15.sp,lineHeight=20.sp),cursorBrush=SolidColor(Yellow),maxLines=4,decorationBox={inner ->
+                        if(draft.isEmpty()) Text(if(selected==null) "Сообщение" else "Подпись",color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=15.sp,lineHeight=20.sp,maxLines=1,overflow=TextOverflow.Ellipsis)
+                        inner()
+                    })
+                    Box {
+                        ChatAction("attach","Прикрепить файл",enabled=!busy) { attachmentsMenu=true }
+                        DropdownMenu(attachmentsMenu,onDismissRequest={attachmentsMenu=false}) {
+                            DropdownMenuItem(text={Text("Фото и видео")},onClick={attachmentsMenu=false;pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))})
+                            DropdownMenuItem(text={Text("Файл")},onClick={attachmentsMenu=false;pickFile.launch(arrayOf("*/*"))})
+                            Text("До 25 МБ",modifier=Modifier.padding(horizontal=12.dp,vertical=6.dp),fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                 }
             }
-            Spacer(Modifier.width(4.dp))
-            val canSend = !busy && (draft.isNotBlank() || selected != null)
-            Box(Modifier.size(36.dp).clip(CircleShape).background(if (canSend || sending) Yellow else MaterialTheme.colorScheme.surface).clickable(enabled = canSend, role = Role.Button, onClick = send).semantics { contentDescription = "Отправить" }, contentAlignment = Alignment.Center) {
-                if (sending) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = Ink)
-                else ChatGlyph("send", if (canSend) Ink else MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(6.dp))
+            val hasContent=draft.isNotBlank() || selected!=null
+            val waiting=sending || preparing || clearing || startingVoice
+            val action=if(waiting) "busy" else if(recording) "stop" else if(hasContent) "send" else "mic"
+            Box(Modifier.size(42.dp).clip(CircleShape).background(Yellow.copy(alpha=if(waiting) .65f else 1f))
+                .clickable(enabled=!waiting,role=Role.Button) {
+                    when(action) {
+                        "stop" -> finishVoice()
+                        "send" -> send()
+                        else -> if(androidx.core.content.ContextCompat.checkSelfPermission(context,android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED) startVoice() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                    }
+                }.semantics { contentDescription=when(action){"mic"->"Записать голосовое";"stop"->"Остановить запись";"busy"->"Обработка сообщения";else->"Отправить"} },contentAlignment=Alignment.Center) {
+                AnimatedContent(action,transitionSpec={ (fadeIn(tween(140))+scaleIn(initialScale=.6f,animationSpec=tween(160))) togetherWith (fadeOut(tween(90))+scaleOut(targetScale=.65f,animationSpec=tween(100))) },label="microphone-send") { mode ->
+                    if(mode=="busy") CircularProgressIndicator(Modifier.size(19.dp),strokeWidth=2.dp,color=Ink) else ChatGlyph(mode,Ink)
+                }
             }
         }
     }
+
     if (confirmClear) AlertDialog(onDismissRequest = { if (!clearing) confirmClear = false }, title = { Text("Очистить диалог?") }, text = { Text(if (saved) "Все сообщения и файлы из Избранного будут удалены с этого телефона." else "Все сообщения этого диалога будут скрыты у тебя на всех устройствах. У собеседника история останется.") }, confirmButton = {
         TextButton(enabled = !clearing, onClick = {
-            clearing = true; sendError = null
+            audio.stop(); clearing = true; sendError = null
             scope.launch {
                 try {
                     if (saved) { val removed = messages; kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { store.clearMessages(person.id) }; messages = emptyList(); removed.forEach { it.attachment?.let { attachment -> media.removeLocal(attachment) } } }
@@ -223,7 +305,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
 private fun fileSize(bytes: Long): String = if (bytes >= 1024 * 1024) String.format(java.util.Locale.getDefault(), "%.1f МБ", bytes / (1024.0 * 1024.0)) else "${(bytes + 1023) / 1024} КБ"
 
 @Composable
-private fun AttachmentBubble(attachment: Attachment, media: MediaFiles, mine: Boolean) {
+internal fun AttachmentBubble(attachment: Attachment, media: MediaFiles, contentColor: Color) {
     val scope = rememberCoroutineScope()
     var bitmap by remember(attachment.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
     var loading by remember(attachment.id) { mutableStateOf(false) }
@@ -239,7 +321,7 @@ private fun AttachmentBubble(attachment: Attachment, media: MediaFiles, mine: Bo
             finally { loading = false }
         }
     }
-    val color = if (mine) Ink else MaterialTheme.colorScheme.onSurface
+    val color = contentColor
     Column(Modifier.widthIn(max = 240.dp).clickable(role = Role.Button) {
         if (photo && error != null) attempt++ else scope.launch {
             loading = true; error = null
@@ -261,16 +343,20 @@ private fun AttachmentBubble(attachment: Attachment, media: MediaFiles, mine: Bo
 }
 
 @Composable
-private fun ChatAction(kind: String, label: String, enabled: Boolean = true, compact: Boolean = false, onClick: () -> Unit) {
+internal fun ChatAction(kind: String, label: String, enabled: Boolean = true, compact: Boolean = false, onClick: () -> Unit) {
     Box(Modifier.size(if (compact) 36.dp else 40.dp).clip(CircleShape).clickable(enabled = enabled, role = Role.Button, onClick = onClick).semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
         ChatGlyph(kind, MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else .4f))
     }
 }
 @Composable
-private fun ChatGlyph(kind: String, color: Color) {
+internal fun ChatGlyph(kind: String, color: Color) {
     Canvas(Modifier.size(21.dp)) {
         val w = size.width; val h = size.height; val line = w * .075f
         when (kind) {
+            "mic" -> { drawRoundRect(color, Offset(w*.36f,h*.09f), Size(w*.28f,h*.51f), androidx.compose.ui.geometry.CornerRadius(w*.14f)); drawPath(Path().apply { moveTo(w*.22f,h*.42f); cubicTo(w*.22f,h*.88f,w*.78f,h*.88f,w*.78f,h*.42f) },color,style=Stroke(line)); drawLine(color,Offset(w*.5f,h*.76f),Offset(w*.5f,h*.94f),line); drawLine(color,Offset(w*.33f,h*.94f),Offset(w*.67f,h*.94f),line) }
+            "play" -> drawPath(Path().apply { moveTo(w*.3f,h*.16f); lineTo(w*.8f,h*.5f); lineTo(w*.3f,h*.84f); close() },color)
+            "pause" -> { drawRoundRect(color,Offset(w*.28f,h*.18f),Size(w*.15f,h*.64f),androidx.compose.ui.geometry.CornerRadius(w*.03f)); drawRoundRect(color,Offset(w*.57f,h*.18f),Size(w*.15f,h*.64f),androidx.compose.ui.geometry.CornerRadius(w*.03f)) }
+            "stop" -> drawRoundRect(color,Offset(w*.23f,h*.23f),Size(w*.54f,h*.54f),androidx.compose.ui.geometry.CornerRadius(w*.08f))
             "menu" -> for (y in listOf(.22f, .5f, .78f)) drawCircle(color, w*.065f, Offset(w*.5f, h*y))
             "back" -> { drawLine(color, Offset(w*.65f,h*.2f), Offset(w*.35f,h*.5f), line); drawLine(color, Offset(w*.35f,h*.5f), Offset(w*.65f,h*.8f), line) }
             "close" -> { drawLine(color, Offset(w*.28f,h*.28f), Offset(w*.72f,h*.72f), line); drawLine(color, Offset(w*.72f,h*.28f), Offset(w*.28f,h*.72f), line) }

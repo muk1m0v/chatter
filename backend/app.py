@@ -252,6 +252,6 @@ def conversations(authorization: str | None = Header(default=None)):
         rows = db.execute('''WITH latest AS (
           SELECT CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS peer_id, MAX(id) AS last_id
           FROM messages WHERE (sender_id=? OR recipient_id=?) AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END),0) GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)
-          SELECT p.*, COALESCE(NULLIF(m.text,''),'📎 Вложение') AS last_text, m.id AS last_message_id FROM latest l
-          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
+          SELECT p.*, COALESCE(NULLIF(m.text,''),CASE WHEN a.kind='voice' THEN 'Голосовое сообщение' ELSE '📎 Вложение' END) AS last_text, m.id AS last_message_id FROM latest l
+          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id LEFT JOIN attachments a ON a.id=m.attachment_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
         return {'conversations': [{'profile': public(row), 'last_text': row['last_text'], 'last_message_id': row['last_message_id']} for row in rows]}

@@ -72,6 +72,11 @@ class PushDispatcher:
             if not target or message['id'] <= media.cutoff(db, message['recipient_id'], message['sender_id']) or time.time() - message['created'] > 86400:
                 db.execute("UPDATE push_jobs SET state='skipped' WHERE message_id=?", (message['id'],))
                 return True
+            if message['attachment_id'] and not message['text']:
+                attachment = media.metadata(db, message['attachment_id'])
+                if attachment and attachment['kind'] == 'voice':
+                    message = dict(message)
+                    message['text'] = 'Голосовое сообщение'
             token = target['token']
         code = 'NETWORK'
         permanent = False

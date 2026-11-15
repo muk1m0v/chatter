@@ -107,4 +107,33 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(self.client.delete('/messages',params={'peer_id':str(uuid.uuid4())},headers=self.headers()).status_code,404)
         self.assertEqual(self.send({'id':str(uuid.uuid4())}).status_code,400)
 
+    def test_voice_metadata_round_trip_and_private_access(self):
+        params={'peer_id':self.ids[1], 'name':'voice_qa.m4a', 'kind':'voice', 'duration_ms':1234, 'waveform':'0,12,100,3'}
+        result=self.client.post('/attachments',params=params,headers={**self.headers(),'Content-Type':'audio/mp4'},content=b'Voice transport QA')
+        self.assertEqual(result.status_code,200,result.text)
+        attachment=result.json()
+        self.assertEqual((attachment['kind'],attachment['duration_ms'],attachment['waveform']),('voice',1234,[0,12,100,3]))
+        self.assertEqual(self.send(attachment).status_code,200)
+        received=self.history(1,0)['messages'][0]['attachment']
+        self.assertEqual(received,attachment)
+        self.assertEqual(self.client.get('/conversations',headers=self.headers(1)).json()['conversations'][0]['last_text'],'Голосовое сообщение')
+        self.assertEqual(self.download(attachment,1).content,b'Voice transport QA')
+        self.assertEqual(self.download(attachment,2).status_code,404)
+
+    def test_invalid_voice_metadata_is_rejected(self):
+        base={'peer_id':self.ids[1], 'name':'voice.m4a', 'kind':'voice','duration_ms':1000,'waveform':'1,20,30'}
+        for change in ({'duration_ms':0},{'duration_ms':999},{'duration_ms':300001},{'waveform':'-1,2'},{'waveform':'101'},{'waveform':'x'},{'waveform':','.join(['1']*33)},{'waveform':''}):
+            result=self.client.post('/attachments',params={**base,**change},headers={**self.headers(),'Content-Type':'audio/mp4'},content=b'qa')
+            self.assertIn(result.status_code,(400,422),change)
+        result=self.client.post('/attachments',params=base,headers={**self.headers(),'Content-Type':'image/png'},content=b'qa')
+        self.assertEqual(result.status_code,400)
+        with app.connect() as db: self.assertEqual(db.execute('SELECT COUNT(*) FROM attachments').fetchone()[0],0)
+
+    def test_existing_files_keep_default_kind_and_schema_is_repeatable(self):
+        attachment=self.upload().json()
+        self.assertEqual((attachment['kind'],attachment['duration_ms'],attachment['waveform']),('file',0,[]))
+        app.initialize()
+        self.assertEqual(self.send(attachment).status_code,200)
+        self.assertEqual(self.history()['messages'][0]['attachment'],attachment)
+
 if __name__=='__main__': unittest.main()

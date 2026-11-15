@@ -1,4 +1,5 @@
 """Private bounded attachments; only the sender and visible conversation recipient may read."""
+import json
 import os
 from pathlib import Path
 import re
@@ -23,13 +24,19 @@ def schema(db):
       owner_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
       peer_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
       through_id INTEGER NOT NULL, PRIMARY KEY(owner_id,peer_id));''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(attachments)')}
+    for name, definition in [('kind', "TEXT NOT NULL DEFAULT 'file'"), ('duration_ms', 'INTEGER NOT NULL DEFAULT 0'), ('waveform', "TEXT NOT NULL DEFAULT '[]'")]:
+        if name not in columns: db.execute('ALTER TABLE attachments ADD COLUMN ' + name + ' ' + definition)
     if 'attachment_id' not in {row[1] for row in db.execute('PRAGMA table_info(messages)')}:
         db.execute('ALTER TABLE messages ADD COLUMN attachment_id TEXT REFERENCES attachments(id)')
 
 def metadata(db, attachment_id):
     if not attachment_id: return None
-    row = db.execute('SELECT id,name,mime,size FROM attachments WHERE id=? AND ready=1', (attachment_id,)).fetchone()
-    return dict(row) if row else None
+    row = db.execute('SELECT id,name,mime,size,kind,duration_ms,waveform FROM attachments WHERE id=? AND ready=1', (attachment_id,)).fetchone()
+    if not row: return None
+    result = dict(row)
+    result['waveform'] = json.loads(result['waveform'])
+    return result
 
 def cutoff(db, owner, peer):
     row = db.execute('SELECT through_id FROM conversation_clears WHERE owner_id=? AND peer_id=?', (owner, peer)).fetchone()
@@ -37,7 +44,7 @@ def cutoff(db, owner, peer):
 
 def install_routes(app, connect, current_profile):
     @app.post('/attachments')
-    async def upload(request: Request, peer_id: str = Query(min_length=36, max_length=36), name: str = Query(min_length=1, max_length=180), authorization: str | None = Header(default=None)):
+    async def upload(request: Request, peer_id: str = Query(min_length=36, max_length=36), name: str = Query(min_length=1, max_length=180), kind: str = Query(default='file', pattern='^(file|voice)$'), duration_ms: int = Query(default=0, ge=0, le=300000), waveform: str = Query(default='', max_length=160), authorization: str | None = Header(default=None)):
         owner = current_profile(authorization)['id']
         try: uuid.UUID(peer_id)
         except ValueError: raise HTTPException(400, 'Неверный получатель')
@@ -46,6 +53,12 @@ def install_routes(app, connect, current_profile):
         filename = ''.join(c for c in filename if c.isprintable()).strip()[:180] or 'Файл'
         mime = request.headers.get('content-type', 'application/octet-stream').split(';')[0].lower()
         if not re.fullmatch(r'[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+', mime): mime = 'application/octet-stream'
+        try: peaks = [int(value) for value in waveform.split(',')] if waveform else []
+        except ValueError: raise HTTPException(400, 'Неверная форма голосового сообщения')
+        if len(peaks) > 32 or any(value < 0 or value > 100 for value in peaks): raise HTTPException(400, 'Неверная форма голосового сообщения')
+        if kind == 'voice' and (mime not in ('audio/mp4', 'audio/aac', 'audio/x-m4a') or duration_ms < 1000 or not peaks):
+            raise HTTPException(400, 'Голосовое сообщение должно длиться от 1 секунды до 5 минут')
+        if kind == 'file': duration_ms, peaks = 0, []
         try: reserved = int(request.headers.get('content-length', str(MAX_FILE)))
         except ValueError: raise HTTPException(400, 'Неверный размер файла')
         if reserved <= 0 or reserved > MAX_FILE: raise HTTPException(413, 'Максимальный размер файла — 25 МБ')
@@ -61,7 +74,7 @@ def install_routes(app, connect, current_profile):
                 db.execute('DELETE FROM attachments WHERE id=?', (row['id'],))
             used = db.execute('SELECT COALESCE(SUM(size),0) FROM attachments WHERE owner_id=?', (owner,)).fetchone()[0]
             if used + reserved > MAX_ACCOUNT: raise HTTPException(413, 'Лимит вложений аккаунта — 200 МБ')
-            db.execute('INSERT INTO attachments VALUES(?,?,?,?,?,?,?,0)', (attachment_id, owner, peer_id, filename, mime, reserved, time.time()))
+            db.execute('INSERT INTO attachments(id,owner_id,peer_id,name,mime,size,created,ready,kind,duration_ms,waveform) VALUES(?,?,?,?,?,?,?,0,?,?,?)', (attachment_id, owner, peer_id, filename, mime, reserved, time.time(), kind, duration_ms, json.dumps(peaks)))
         path = ROOT / attachment_id
         complete = False
         try:
