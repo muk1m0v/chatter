@@ -52,6 +52,7 @@ def initialize():
         CREATE INDEX IF NOT EXISTS messages_pair ON messages(sender_id, recipient_id, id);
         CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, id);
         CREATE TABLE IF NOT EXISTS message_events(id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, sender_id TEXT NOT NULL, recipient_id TEXT NOT NULL, owner_id TEXT, kind TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS message_events_pair ON message_events(sender_id,recipient_id,id);
         CREATE TABLE IF NOT EXISTS message_hides(owner_id TEXT NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(owner_id,message_id));
         CREATE TABLE IF NOT EXISTS live_locations(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, peer_id TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, latitude REAL, longitude REAL, updated REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS push_tokens (

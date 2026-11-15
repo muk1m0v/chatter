@@ -240,7 +240,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     } catch (cancelled: CancellationException) { throw cancelled }
                     catch (failure: DirectoryException) { connectionError = failure.message }
                     finally { loading = false }
-                    delay(2500)
+                    delay(1500)
                 }
             }
         }
@@ -249,7 +249,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (isActive) {
                 try { peerOnline = directory.peerOnline(person.id) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { peerOnline = false }
-                delay(15_000)
+                delay(5_000)
             }
         }
     }
@@ -257,7 +257,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (isActive) {
                 try { peerTyping = directory.peerTyping(person.id) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { peerTyping = false }
-                delay(1500)
+                delay(1_000)
             }
         }
     }
@@ -267,7 +267,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 if (typing) {
                     while (true) {
                         try { directory.setTyping(person.id, true) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { }
-                        delay(2500)
+                        delay(2_000)
                     }
                 } else try { directory.setTyping(person.id, false) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { }
             }

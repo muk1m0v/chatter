@@ -283,7 +283,7 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
                 try { remoteChats = directory.conversations(); inboxError = null }
                 catch (exception: CancellationException) { throw exception }
                 catch (exception: DirectoryException) { inboxError = exception.message }
-                delay(5000)
+                delay(3000)
             }
         }
     }
@@ -408,7 +408,7 @@ private fun Settings(updater: AppUpdater, dark: Boolean, onDark: (Boolean) -> Un
                 HorizontalDivider(Modifier.padding(vertical = 18.dp))
                 Detail("На этом телефоне", "Хранение заметок")
                 Spacer(Modifier.height(20.dp))
-                Detail(updater.installedVersion, "Версия Салом")
+                Detail(updater.installedDisplayVersion, "Версия Салом")
                 TextButton(onClick = {
                     val settingsContext = android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
                         .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, "com.mukimov.salom")

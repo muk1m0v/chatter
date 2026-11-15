@@ -23,7 +23,7 @@ internal fun UpdateCard(updater: AppUpdater) {
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Обновление Салома", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Text("Установлена версия ${updater.installedVersion}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Установлена версия ${updater.installedDisplayVersion}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             when (val value = status) {
                 UpdateStatus.Unchecked, UpdateStatus.Checking -> Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = Yellow)
