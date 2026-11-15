@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from urllib.parse import urlparse
 
 from cachecontrol import CacheControl
 from fastapi import Header, HTTPException, Query, Request
@@ -65,7 +66,10 @@ def firebase_identity(token):
         email = claims.get('email', '').strip().lower()
         if claims.get('email_verified') is not True or len(email) > 254 or not EMAIL.fullmatch(email): raise ValueError()
         if not claims.get('sub') or not 0 <= now - claims.get('auth_time', 0) <= 900: raise ValueError()
-        return {'email': email, 'firebase_uid': claims['sub']}
+        picture = claims.get('picture', '')
+        parsed = urlparse(picture) if isinstance(picture, str) else None
+        avatar_url = picture if parsed and parsed.scheme == 'https' and (parsed.hostname or '').endswith('googleusercontent.com') and len(picture) < 2048 else ''
+        return {'email': email, 'firebase_uid': claims['sub'], 'avatar_url': avatar_url}
     except Exception:
         raise HTTPException(401, 'Вход Google недействителен или устарел. Выбери аккаунт ещё раз')
 
@@ -137,6 +141,8 @@ def install_routes(app, connect, current_profile, public, digest):
                     try: db.execute('UPDATE profiles SET username=?,username_key=?,updated=? WHERE id=?', (proof.username, proof.username.lower(), now, target))
                     except sqlite3.IntegrityError: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
             elif existing:
+                if contact['avatar_url']:
+                    db.execute('UPDATE profiles SET avatar_url=? WHERE id=?', (contact['avatar_url'], existing['profile_id']))
                 if not existing['google_linked']:
                     db.execute('UPDATE accounts SET google_linked=1,email=? WHERE profile_id=?', (contact['email'], existing['profile_id']))
                 else:
@@ -150,9 +156,11 @@ def install_routes(app, connect, current_profile, public, digest):
                 if not name: raise HTTPException(400, 'Укажи имя')
                 target = str(uuid.uuid4())
                 try:
-                    db.execute('INSERT INTO profiles VALUES(?,?,?,?,?,1,?,?)', (target, hash_token(secrets.token_urlsafe(32)), name, proof.username, proof.username.lower(), now, now))
+                    db.execute('INSERT INTO profiles(id,token_hash,name,username,username_key,is_active,created,updated) VALUES(?,?,?,?,?,1,?,?)', (target, hash_token(secrets.token_urlsafe(32)), name, proof.username, proof.username.lower(), now, now))
                 except sqlite3.IntegrityError: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
             try:
+                if contact['avatar_url']:
+                    db.execute('UPDATE profiles SET avatar_url=? WHERE id=?', (contact['avatar_url'], target))
                 db.execute('INSERT INTO accounts(profile_id,firebase_uid,email,created,google_linked) VALUES(?,?,?,?,1) ON CONFLICT(profile_id) DO UPDATE SET firebase_uid=excluded.firebase_uid,email=excluded.email,google_linked=1',
                            (target, contact['firebase_uid'], contact['email'], now))
             except sqlite3.IntegrityError: raise HTTPException(409, 'Google уже связан с другим аккаунтом')

@@ -48,6 +48,7 @@ internal class AuthClient(private val context: Context, private val directory: D
             if (changedAccount) remove("about")
             remove("phone")
             putString("name", profile.getString("name")); putString("username", profile.getString("username"))
+            putString("avatar_url", profile.optString("avatar_url"))
             putString("email", result.optString("email"))
             putString("account_verified", "yes"); putString("signed_in", "yes")
             putString("owner_profile_id", profile.getString("id"))

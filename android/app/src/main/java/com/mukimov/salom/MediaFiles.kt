@@ -65,8 +65,8 @@ internal class MediaFiles(private val context: Context, private val directory: D
             initial.copy(size = size)
         } catch (failure: Exception) { file.delete(); throw failure }
     }
-    suspend fun upload(peer: String, attachment: Attachment): Attachment = withContext(Dispatchers.IO) {
-        val result = directory.uploadAttachment(peer, attachment, target(attachment))
+    suspend fun upload(peer: String, attachment: Attachment, progress: (Float) -> Unit = {}): Attachment = withContext(Dispatchers.IO) {
+        val result = directory.uploadAttachment(peer, attachment, target(attachment), progress)
         target(attachment).copyTo(target(result), overwrite = true)
         result
     }

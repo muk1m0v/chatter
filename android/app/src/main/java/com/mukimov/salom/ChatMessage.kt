@@ -1,6 +1,8 @@
 package com.mukimov.salom
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.combinedClickable
@@ -11,6 +13,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -22,16 +26,16 @@ import androidx.compose.ui.unit.sp
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun ChatMessage(message: Message, maxWidth: androidx.compose.ui.unit.Dp, media: MediaFiles, player: ChatAudioPlayer, grouped: Boolean, onReply: (() -> Unit)? = null, peerName: String = "Собеседник") {
+internal fun ChatMessage(message: Message, maxWidth: androidx.compose.ui.unit.Dp, media: MediaFiles, player: ChatAudioPlayer, grouped: Boolean, onReply: (() -> Unit)? = null, onLongPress: (() -> Unit)? = null, onLocation: ((String) -> Unit)? = null, peerName: String = "Собеседник") {
     val dark = MaterialTheme.colorScheme.background.red < .5f
     val textColor = if (message.mine) (if (dark) Color(0xFFFFF0BD) else Ink) else (if (dark) Color(0xFFECF1F6) else Ink)
     val bubbleColor = if (message.mine) (if (dark) Color(0xFF45452C) else Color(0xFFFFEDB2)) else (if (dark) Color(0xFF23313D) else Color.White)
     val emoji = message.attachment == null && VoicePolicy.emojiOnly(message.text)
     Row(Modifier.fillMaxWidth().padding(top = if (grouped) 1.dp else 5.dp), horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start) {
-        if (emoji) Column(Modifier.combinedClickable(enabled = onReply != null, onClick = {}, onLongClick = { onReply?.invoke() }), horizontalAlignment = if (message.mine) Alignment.End else Alignment.Start) {
+        if (emoji) Column(Modifier.combinedClickable(enabled = onReply != null || onLongPress != null, onClick = {}, onLongClick = { onLongPress?.invoke() ?: onReply?.invoke() }), horizontalAlignment = if (message.mine) Alignment.End else Alignment.Start) {
             Text(message.text, fontSize = 44.sp, lineHeight = 55.sp, modifier = Modifier.padding(horizontal = 6.dp))
             if (message.time.isNotEmpty()) MessageMeta(message.time, message.receipt, message.mine, dark, Modifier.clip(RoundedCornerShape(8.dp)).background(if (dark) Color(0x30202D38) else Color(0x20FFFFFF)).padding(horizontal = 5.dp, vertical = 1.dp))
-        } else Column(Modifier.widthIn(max = maxWidth).clip(RoundedCornerShape(17.dp,17.dp,if (message.mine) 5.dp else 17.dp,if (message.mine) 17.dp else 5.dp)).background(bubbleColor).combinedClickable(enabled = onReply != null, onClick = {}, onLongClick = { onReply?.invoke() }).padding(horizontal=10.dp,vertical=6.dp)) {
+        } else Column(Modifier.widthIn(max = maxWidth).clip(RoundedCornerShape(17.dp,17.dp,if (message.mine) 5.dp else 17.dp,if (message.mine) 17.dp else 5.dp)).background(bubbleColor).combinedClickable(enabled = onReply != null || onLongPress != null, onClick = {}, onLongClick = { onLongPress?.invoke() ?: onReply?.invoke() }).padding(horizontal=10.dp,vertical=6.dp)) {
             message.replyPreview?.let { preview ->
                 Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp)).background(if (dark) Color.White.copy(alpha = .055f) else Color.Black.copy(alpha = .045f)).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.width(2.dp).heightIn(min = 27.dp).background(if (message.mine) Yellow else Color(0xFF4AA5E5)))
@@ -43,6 +47,15 @@ internal fun ChatMessage(message: Message, maxWidth: androidx.compose.ui.unit.Dp
                 Spacer(Modifier.height(4.dp))
             }
             val attachment = message.attachment
+            message.locationId?.let { id ->
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(if(dark) Color(0xFF314134) else Color(0xFFEAF4E5)).clickable { onLocation?.invoke(id) }.padding(horizontal=10.dp,vertical=10.dp),verticalAlignment=Alignment.CenterVertically) {
+                    Text("⌖",fontSize=23.sp,color=Color(0xFF258A50)); Column(Modifier.padding(start=8.dp)) {
+                        Text("Местоположение",fontSize=13.sp,fontWeight=FontWeight.SemiBold,color=textColor)
+                        Text(if(message.mine) "Открыть карту или остановить передачу" else "Открыть в Google Картах",fontSize=10.sp,color=textColor.copy(alpha=.7f))
+                    }
+                }
+                Spacer(Modifier.height(3.dp))
+            }
             if (attachment != null) {
                 if (attachment.mime.startsWith("audio/")) AudioBubble(attachment, player, textColor)
                 else AttachmentBubble(attachment, media, textColor)
@@ -53,6 +66,7 @@ internal fun ChatMessage(message: Message, maxWidth: androidx.compose.ui.unit.Dp
                 if (message.text.isNotEmpty()) Text(message.text, color=textColor, fontSize=15.sp,lineHeight=20.sp,modifier=Modifier.padding(top=3.dp))
                 if (message.time.isNotEmpty()) MessageMeta(message.time, message.receipt, message.mine, dark, Modifier.align(Alignment.End).padding(top=2.dp), textColor)
             }
+            if (message.edited) Text("изменено",fontSize=9.sp,fontStyle=androidx.compose.ui.text.font.FontStyle.Italic,color=textColor.copy(alpha=.6f),modifier=Modifier.align(Alignment.End).padding(top=1.dp))
         }
     }
 }
@@ -83,10 +97,19 @@ private fun MessageMeta(time: String, receipt: String, mine: Boolean, dark: Bool
             Spacer(Modifier.width(3.dp))
             when (receipt) {
                 "pending" -> androidx.compose.material3.CircularProgressIndicator(Modifier.size(9.dp), strokeWidth = 1.dp, color = contentColor.copy(alpha = .72f))
-                "read" -> Text("✓✓", fontSize = 10.sp, lineHeight = 11.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF38C878))
-                "delivered" -> Text("✓✓", fontSize = 10.sp, lineHeight = 11.sp, fontWeight = FontWeight.Medium, color = contentColor.copy(alpha = .78f))
+                "read" -> DoubleCheck(Color(0xFF38C878))
+                "delivered" -> DoubleCheck(contentColor.copy(alpha = .78f))
                 else -> Text("✓", fontSize = 10.sp, lineHeight = 11.sp, fontWeight = FontWeight.Medium, color = contentColor.copy(alpha = .72f))
             }
         }
+    }
+}
+
+@Composable
+private fun DoubleCheck(color: Color) {
+    Canvas(Modifier.size(width=14.dp,height=10.dp)) {
+        val stroke=size.width*.11f
+        fun check(x:Float) { val p=androidx.compose.ui.graphics.Path().apply { moveTo(x,size.height*.52f); lineTo(x+size.width*.16f,size.height*.78f); lineTo(x+size.width*.43f,size.height*.22f) }; drawPath(p,color,style=androidx.compose.ui.graphics.drawscope.Stroke(width=stroke,cap=androidx.compose.ui.graphics.StrokeCap.Round,join=androidx.compose.ui.graphics.StrokeJoin.Round)) }
+        check(0f); check(size.width*.42f)
     }
 }

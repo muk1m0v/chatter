@@ -51,6 +51,9 @@ def initialize():
           UNIQUE(sender_id, client_id));
         CREATE INDEX IF NOT EXISTS messages_pair ON messages(sender_id, recipient_id, id);
         CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, id);
+        CREATE TABLE IF NOT EXISTS message_events(id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, sender_id TEXT NOT NULL, recipient_id TEXT NOT NULL, owner_id TEXT, kind TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS message_hides(owner_id TEXT NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(owner_id,message_id));
+        CREATE TABLE IF NOT EXISTS live_locations(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, peer_id TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, latitude REAL, longitude REAL, updated REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS push_tokens (
           profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
           token TEXT NOT NULL UNIQUE, updated REAL NOT NULL);
@@ -64,10 +67,13 @@ def initialize():
         if 'online_at' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN online_at REAL NOT NULL DEFAULT 0')
         if 'typing_to' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN typing_to TEXT')
         if 'typing_at' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN typing_at REAL NOT NULL DEFAULT 0')
+        if 'avatar_url' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN avatar_url TEXT')
         message_columns = {row['name'] for row in db.execute('PRAGMA table_info(messages)')}
         if 'delivered_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN delivered_at REAL')
         if 'read_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN read_at REAL')
         if 'reply_to_id' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER')
+        if 'edited_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN edited_at REAL')
+        if 'location_id' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN location_id TEXT')
         auth_schema(db)
         media.schema(db)
 
@@ -104,7 +110,7 @@ def digest(authorization):
     return hashlib.sha256(token.encode()).hexdigest()
 
 def public(row):
-    return {'id': row['id'], 'name': row['name'], 'username': row['username'] or '', 'is_active': bool(row['is_active'])}
+    return {'id': row['id'], 'name': row['name'], 'username': row['username'] or '', 'is_active': bool(row['is_active']), 'avatar_url': row['avatar_url'] or ''}
 
 def with_presence(row):
     result = public(row)
@@ -194,7 +200,114 @@ def message_json(row, db):
         if ref:
             preview = ref['text'] or ('Фото' if ref['kind'] == 'image' else 'Видео' if ref['kind'] == 'video' else 'Голосовое сообщение' if ref['kind'] == 'voice' else ref['name'] or 'Вложение')
             reply = {'id': ref['id'], 'sender_id': ref['sender_id'], 'text': preview[:300]}
-    return {**{key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}, 'receipt': receipt, 'attachment': media.metadata(db, row['attachment_id']), 'reply_to': reply}
+    return {**{key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}, 'edited_at': row['edited_at'], 'receipt': receipt, 'attachment': media.metadata(db, row['attachment_id']), 'reply_to': reply, 'location_id': row['location_id']}
+
+class LiveLocationInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    peer_id: str = Field(min_length=36,max_length=36)
+    duration_minutes: int = Field(ge=15,le=1440)
+
+class LocationPoint(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    latitude: float = Field(ge=-90,le=90)
+    longitude: float = Field(ge=-180,le=180)
+
+class SingleLocationInput(LocationPoint):
+    peer_id: str = Field(min_length=36,max_length=36)
+
+@app.post('/locations/once')
+def send_location_once(body: SingleLocationInput, authorization: str | None = Header(default=None)):
+    me=current_profile(authorization)
+    try: UUID(body.peer_id)
+    except ValueError: raise HTTPException(400,'Неверный собеседник')
+    now=time.time(); share=str(uuid.uuid4())
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if body.peer_id==me['id'] or not db.execute('SELECT 1 FROM profiles WHERE id=? AND is_active=1',(body.peer_id,)).fetchone(): raise HTTPException(404,'Получатель недоступен')
+        db.execute('INSERT INTO live_locations(id,owner_id,peer_id,created,expires,latitude,longitude,updated,active) VALUES(?,?,?,?,?,?,?,?,0)',(share,me['id'],body.peer_id,now,now+7*86400,body.latitude,body.longitude,now))
+        cur=db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created,location_id) VALUES(?,?,?,?,?,?)',(me['id'],body.peer_id,str(uuid.uuid4()),'Отправил геопозицию',now,share))
+        db.execute('INSERT INTO push_jobs(message_id) VALUES(?)',(cur.lastrowid,)); app.state.push.wake.set()
+        message=message_json(db.execute('SELECT * FROM messages WHERE id=?',(cur.lastrowid,)).fetchone(),db)
+    return {'message':message}
+
+@app.post('/locations')
+def start_location(body: LiveLocationInput, authorization: str | None = Header(default=None)):
+    me=current_profile(authorization)
+    try: UUID(body.peer_id)
+    except ValueError: raise HTTPException(400,'Неверный собеседник')
+    if body.peer_id==me['id']: raise HTTPException(400,'Выбери собеседника')
+    now=time.time(); share=str(uuid.uuid4()); client_id=str(uuid.uuid4())
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if not db.execute('SELECT 1 FROM profiles WHERE id=? AND is_active=1',(body.peer_id,)).fetchone(): raise HTTPException(404,'Получатель недоступен')
+        db.execute('INSERT INTO live_locations(id,owner_id,peer_id,created,expires,updated) VALUES(?,?,?,?,?,?)',(share,me['id'],body.peer_id,now,now+body.duration_minutes*60,now))
+        cur=db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created,location_id) VALUES(?,?,?,?,?,?)',(me['id'],body.peer_id,client_id,'Поделился геопозицией в реальном времени',now,share))
+        db.execute('INSERT INTO push_jobs(message_id) VALUES(?)',(cur.lastrowid,)); app.state.push.wake.set()
+        row=db.execute('SELECT * FROM messages WHERE id=?',(cur.lastrowid,)).fetchone()
+    return {'id':share,'message':message_json(row,db),'expires':now+body.duration_minutes*60}
+
+@app.put('/locations/{share_id}')
+def update_location(share_id: uuid.UUID, body: LocationPoint, authorization: str | None = Header(default=None)):
+    me=current_profile(authorization); now=time.time()
+    with connect() as db:
+        cur=db.execute('UPDATE live_locations SET latitude=?,longitude=?,updated=? WHERE id=? AND owner_id=? AND active=1 AND expires>?',(body.latitude,body.longitude,now,str(share_id),me['id'],now))
+        if cur.rowcount!=1: raise HTTPException(404,'Передача геопозиции завершена')
+    return {'updated':now}
+
+@app.get('/locations/{share_id}')
+def get_location(share_id: uuid.UUID, authorization: str | None = Header(default=None)):
+    me=current_profile(authorization); now=time.time()
+    with connect() as db:
+        row=db.execute('SELECT * FROM live_locations WHERE id=? AND (owner_id=? OR peer_id=?)',(str(share_id),me['id'],me['id'])).fetchone()
+        if not row: raise HTTPException(404,'Геопозиция недоступна')
+        if row['expires']<=now and row['active']: db.execute('UPDATE live_locations SET active=0 WHERE id=?',(str(share_id),)); row=dict(row); row['active']=0
+        return {'id':row['id'],'owner_id':row['owner_id'],'peer_id':row['peer_id'],'expires':row['expires'],'updated':row['updated'],'active':bool(row['active']) and row['expires']>now,'latitude':row['latitude'],'longitude':row['longitude']}
+
+@app.delete('/locations/{share_id}')
+def stop_location(share_id: uuid.UUID, authorization: str | None = Header(default=None)):
+    me=current_profile(authorization)
+    with connect() as db:
+        cur=db.execute('UPDATE live_locations SET active=0 WHERE id=? AND owner_id=? AND active=1',(str(share_id),me['id']))
+        if cur.rowcount!=1: raise HTTPException(404,'Передача уже завершена')
+    return {'stopped':True}
+
+def message_scope(db, me, message_id):
+    row = db.execute('SELECT * FROM messages WHERE id=? AND (sender_id=? OR recipient_id=?)', (message_id, me, me)).fetchone()
+    if not row: raise HTTPException(404, 'Сообщение уже недоступно')
+    return row
+
+@app.put('/messages/{message_id}')
+def edit_message(message_id: int, body: dict, authorization: str | None = Header(default=None)):
+    me = current_profile(authorization)
+    text = str(body.get('text', '')).strip()
+    if not text or len(text) > 4000: raise HTTPException(400, 'Сообщение должно содержать от 1 до 4000 символов')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = message_scope(db, me['id'], message_id)
+        if row['sender_id'] != me['id'] or row['attachment_id']: raise HTTPException(403, 'Можно изменить только своё текстовое сообщение')
+        db.execute('UPDATE messages SET text=?,edited_at=? WHERE id=?', (text, time.time(), message_id))
+        db.execute('INSERT INTO message_events(message_id,sender_id,recipient_id,kind) VALUES(?,?,?,\'edit\')', (message_id,row['sender_id'],row['recipient_id']))
+        return message_json(db.execute('SELECT * FROM messages WHERE id=?',(message_id,)).fetchone(),db)
+
+@app.delete('/messages/{message_id}')
+def delete_message(message_id: int, scope: str = Query(default='me', pattern='^(me|everyone)$'), authorization: str | None = Header(default=None)):
+    me = current_profile(authorization)
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = message_scope(db, me['id'], message_id)
+        sender, recipient = row['sender_id'], row['recipient_id']
+        if scope == 'everyone':
+            if sender != me['id']: raise HTTPException(403, 'Удалить у всех может только автор сообщения')
+            db.execute('INSERT INTO message_events(message_id,sender_id,recipient_id,kind) VALUES(?,?,?,\'delete\')', (message_id,sender,recipient))
+            attachment_id = row['attachment_id']
+            db.execute('DELETE FROM messages WHERE id=?', (message_id,))
+            if attachment_id:
+                db.execute('DELETE FROM attachments WHERE id=?', (attachment_id,))
+                media.ROOT.joinpath(attachment_id).unlink(missing_ok=True)
+        else:
+            db.execute('INSERT OR IGNORE INTO message_hides(owner_id,message_id) VALUES(?,?)', (me['id'],message_id))
+            db.execute('INSERT INTO message_events(message_id,sender_id,recipient_id,owner_id,kind) VALUES(?,?,?,?,\'hide\')', (message_id,sender,recipient,me['id']))
+    return {'deleted': True}
 
 class MessageInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -300,19 +413,27 @@ def get_typing(peer_id: str, authorization: str | None = Header(default=None)):
         return {'typing': bool(row and row['typing_to'] == me['id'] and row['typing_at'] >= time.time() - 6)}
 
 @app.get('/messages')
-def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_after: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
+def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_after: int = Query(default=0, ge=0), events_after: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
     me = current_profile(authorization)
     with connect() as db:
         cleared = media.cutoff(db, me['id'], peer_id)
         now = time.time()
         db.execute('UPDATE messages SET delivered_at=COALESCE(delivered_at,?) WHERE sender_id=? AND recipient_id=? AND id>?', (now, peer_id, me['id'], cleared))
         db.execute('UPDATE messages SET read_at=COALESCE(read_at,?) WHERE sender_id=? AND recipient_id=? AND id>?', (now, peer_id, me['id'], cleared))
-        rows = db.execute('''SELECT * FROM messages WHERE id>? AND
+        rows = db.execute('''SELECT * FROM messages WHERE id>? AND NOT EXISTS(SELECT 1 FROM message_hides h WHERE h.owner_id=? AND h.message_id=messages.id) AND
           ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))
-          ORDER BY id LIMIT 100''', (max(after, cleared), me['id'], peer_id, peer_id, me['id'])).fetchall()
+          ORDER BY id LIMIT 100''', (max(after, cleared), me['id'], me['id'], peer_id, peer_id, me['id'])).fetchall()
         receipts = db.execute('''SELECT id, CASE WHEN read_at IS NOT NULL THEN 'read' WHEN delivered_at IS NOT NULL THEN 'delivered' ELSE 'sent' END AS receipt
           FROM messages WHERE sender_id=? AND recipient_id=? AND id>? ORDER BY id''', (me['id'], peer_id, max(receipts_after, cleared))).fetchall()
-        return {'messages': [message_json(row, db) for row in rows], 'receipts': [{'id': row['id'], 'receipt': row['receipt']} for row in receipts], 'has_more': len(rows) == 100, 'cleared_through': cleared}
+        events = db.execute('''SELECT * FROM message_events WHERE id>? AND ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)) AND (owner_id IS NULL OR owner_id=?) ORDER BY id LIMIT 300''', (events_after, me['id'],peer_id,peer_id,me['id'],me['id'])).fetchall()
+        changes = []
+        for event in events:
+            change = {'id': event['id'], 'message_id': event['message_id'], 'kind': event['kind']}
+            if event['kind'] == 'edit':
+                current = db.execute('SELECT * FROM messages WHERE id=?',(event['message_id'],)).fetchone()
+                if current: change['message'] = message_json(current,db)
+            changes.append(change)
+        return {'messages': [message_json(row, db) for row in rows], 'receipts': [{'id': row['id'], 'receipt': row['receipt']} for row in receipts], 'events': changes, 'has_more': len(rows) == 100, 'cleared_through': cleared}
 
 @app.get('/conversations')
 def conversations(authorization: str | None = Header(default=None)):
@@ -323,7 +444,7 @@ def conversations(authorization: str | None = Header(default=None)):
           AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=messages.sender_id),0)''', (now, me['id'], me['id']))
         rows = db.execute('''WITH latest AS (
           SELECT CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS peer_id, MAX(id) AS last_id
-          FROM messages WHERE (sender_id=? OR recipient_id=?) AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END),0) GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)
+          FROM messages WHERE (sender_id=? OR recipient_id=?) AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END),0) AND NOT EXISTS(SELECT 1 FROM message_hides h WHERE h.owner_id=? AND h.message_id=messages.id) GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)
           SELECT p.*, COALESCE(NULLIF(m.text,''),CASE WHEN a.kind='voice' THEN 'Голосовое сообщение' ELSE '📎 Вложение' END) AS last_text, m.id AS last_message_id FROM latest l
-          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id LEFT JOIN attachments a ON a.id=m.attachment_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
+          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id LEFT JOIN attachments a ON a.id=m.attachment_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
         return {'conversations': [{'profile': public(row), 'last_text': row['last_text'], 'last_message_id': row['last_message_id']} for row in rows]}

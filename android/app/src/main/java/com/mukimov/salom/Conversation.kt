@@ -62,6 +62,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.UUID
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 internal fun Conversation(person: Person, store: Store, directory: DirectoryClient, wallpaperId: String, onWallpaperChange: (String) -> Unit, onBack: () -> Unit) {
     val saved = person.id == "saved"
     val context = LocalContext.current
@@ -83,11 +84,18 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var clearing by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var attachmentsMenu by remember { mutableStateOf(false) }
+    var uploadProgress by remember { mutableFloatStateOf(0f) }
     var confirmClear by remember { mutableStateOf(false) }
+    var showLocationOptions by remember { mutableStateOf(false) }
+    var locationDuration by remember { mutableStateOf("60") }
+    var requestedLocationAction by remember { mutableStateOf("") }
     var connectionError by remember { mutableStateOf<String?>(null) }
     var peerOnline by remember(person.id) { mutableStateOf(false) }
     var peerTyping by remember(person.id) { mutableStateOf(false) }
     var replyingTo by remember(person.id) { mutableStateOf<Message?>(null) }
+    var messageActions by remember { mutableStateOf<Message?>(null) }
+    var confirmDeleteMessage by remember { mutableStateOf<Message?>(null) }
+    var editingMessage by remember(person.id) { mutableStateOf<Message?>(null) }
     var pendingMessage by remember(person.id) { mutableStateOf<Message?>(null) }
     var showWallpapers by remember { mutableStateOf(false) }
     var sendError by remember { mutableStateOf<String?>(null) }
@@ -96,6 +104,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var clearedThrough by remember { mutableLongStateOf(0) }
     var pendingSignature by remember { mutableStateOf("") }
     var pendingId by remember { mutableStateOf("") }
+    var eventCursor by remember(person.id) { mutableLongStateOf(0L) }
     val scope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val listState = rememberLazyListState()
@@ -156,6 +165,53 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument(), choose)
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia(), choose)
 
+    fun openLocationMap(id:String) {
+        scope.launch {
+            try {
+                val point=directory.liveLocation(id)
+                if(point.isNull("latitude") || point.isNull("longitude")) throw DirectoryException("Собеседник ещё не поделился первой точкой")
+                val lat=point.getDouble("latitude"); val lon=point.getDouble("longitude")
+                val uri=android.net.Uri.parse("geo:$lat,$lon?q=$lat,$lon")
+                context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW,uri))
+            } catch(failure:Exception) { sendError=(failure as? DirectoryException)?.message ?: "Не удалось открыть карту" }
+        }
+    }
+
+    var locationPermissionResult by remember { mutableStateOf<Boolean?>(null) }
+    val locationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants -> locationPermissionResult=grants.values.any { it } }
+    fun runLocationAction(action: String) {
+        if (saved) { sendError="Для геопозиции открой чат с собеседником"; return }
+        requestedLocationAction=action
+        val fine=androidx.core.content.ContextCompat.checkSelfPermission(context,android.Manifest.permission.ACCESS_FINE_LOCATION)==android.content.pm.PackageManager.PERMISSION_GRANTED
+        val coarse=androidx.core.content.ContextCompat.checkSelfPermission(context,android.Manifest.permission.ACCESS_COARSE_LOCATION)==android.content.pm.PackageManager.PERMISSION_GRANTED
+        if(fine || coarse) {
+            scope.launch {
+                try {
+                    sendError=null
+                    val location=currentDeviceLocation(context)
+                    if(action=="once") {
+                        val sent=directory.sendLocationOnce(person.id,location.latitude,location.longitude)
+                        messages=(messages+sent).distinctBy { it.remoteId }.sortedBy { it.remoteId }
+                    } else {
+                        val minutes=locationDuration.toIntOrNull()?.takeIf { it in 15..1440 } ?: throw DirectoryException("Укажи время от 15 до 1440 минут")
+                        val (id,message)=directory.startLiveLocation(person.id,minutes)
+                        messages=(messages+message).distinctBy { it.remoteId }.sortedBy { it.remoteId }
+                        val service=android.content.Intent(context,LiveLocationService::class.java).putExtra(LiveLocationService.EXTRA_ID,id).putExtra(LiveLocationService.EXTRA_PEER,person.name).putExtra(LiveLocationService.EXTRA_EXPIRES,System.currentTimeMillis()+minutes*60_000L)
+                        androidx.core.content.ContextCompat.startForegroundService(context,service)
+                    }
+                    showLocationOptions=false
+                } catch(failure:Exception) { sendError=(failure as? DirectoryException)?.message ?: "Не удалось получить геопозицию. Проверь GPS и повтори" }
+            }
+        } else locationPermission.launch(arrayOf(android.Manifest.permission.ACCESS_COARSE_LOCATION,android.Manifest.permission.ACCESS_FINE_LOCATION))
+    }
+    LaunchedEffect(locationPermissionResult) {
+        when(locationPermissionResult) {
+            true -> { locationPermissionResult=null; runLocationAction(requestedLocationAction) }
+            false -> { locationPermissionResult=null; sendError="Разреши доступ к геопозиции, чтобы отправить её собеседнику" }
+            null -> Unit
+        }
+    }
+
     LaunchedEffect(person.id) { if (!saved) PushNotifications.cancelChat(context, person.id) }
 
     LaunchedEffect(person.id, retry) {
@@ -166,10 +222,18 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     try {
                         do {
                             val receiptCursor = messages.filter { it.mine && it.remoteId > 0 }.minOfOrNull { it.remoteId } ?: 0L
-                            val batch = directory.messages(person.id, cursor, receiptCursor)
+                            val batch = directory.messages(person.id, cursor, receiptCursor, eventCursor)
                             clearedThrough = maxOf(clearedThrough, batch.clearedThrough)
                             val refreshed = messages.map { message -> if (message.mine) batch.receipts[message.remoteId]?.let { message.copy(receipt = it) } ?: message else message }
-                            messages = (refreshed.associateBy { it.remoteId } + batch.messages.associateBy { it.remoteId }).values.filter { it.remoteId > clearedThrough }.sortedBy { it.remoteId }
+                            val merged = (refreshed.associateBy { it.remoteId } + batch.messages.associateBy { it.remoteId }).toMutableMap()
+                            batch.events.forEach { event ->
+                                when(event.kind) {
+                                    "edit" -> event.message?.let { merged[it.remoteId] = it }
+                                    "delete", "hide" -> merged.remove(event.messageId)
+                                }
+                            }
+                            messages = merged.values.filter { it.remoteId > clearedThrough }.sortedBy { it.remoteId }
+                            eventCursor = maxOf(eventCursor, batch.events.lastOrNull()?.id ?: eventCursor)
                             cursor = maxOf(cursor, clearedThrough, batch.messages.lastOrNull()?.remoteId ?: 0)
                         } while (batch.hasMore)
                         connectionError = null
@@ -213,6 +277,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     val send: () -> Unit = {
         val text = draft.trim()
         val attachment = selected
+        val editing = editingMessage
         if ((text.isNotEmpty() || attachment != null) && !busy) {
             if (attachment != null && audio.activeId == attachment.id) audio.stop()
             sending = true; sendError = null; micDenied = false
@@ -221,19 +286,25 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             if (signature != pendingSignature || pendingId.isEmpty()) { pendingSignature = signature; pendingId = UUID.randomUUID().toString() }
             val clientId = pendingId
             val sentAt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-            if (!saved) pendingMessage = Message(text, true, sentAt, attachment = attachment, receipt = "pending", replyToId = quote?.remoteId, replyAuthor = if (quote?.mine == true) "Вы" else person.name, replyPreview = quote?.let(::replyPreview))
+            if (!saved && editing == null) pendingMessage = Message(text, true, sentAt, attachment = attachment, receipt = "pending", replyToId = quote?.remoteId, replyAuthor = if (quote?.mine == true) "Вы" else person.name, replyPreview = quote?.let(::replyPreview))
             scope.launch {
                 try {
+                    if (editing != null && !saved) {
+                        val changed = directory.editMessage(editing.remoteId, text)
+                        messages = messages.map { if (it.remoteId == changed.remoteId) changed else it }
+                    } else {
                     val sent = if (saved) {
                         val local = attachment?.let { media.saveLocal(it) }
                         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
                         Message(text, true, time, attachment = local)
                     } else {
-                        if (attachment != null && uploaded == null) uploaded = media.upload(person.id, attachment)
+                        if (attachment != null && uploaded == null) { uploadProgress = 0f; uploaded = media.upload(person.id, attachment) { uploadProgress = it } }
                         directory.sendMessage(person.id, text, clientId, uploaded, quote?.remoteId)
                     }
                     messages = if (saved) messages + sent else (messages + sent).filter { it.remoteId > clearedThrough }.distinctBy { it.remoteId }.sortedBy { it.remoteId }
                     if (saved) store.saveMessages(person.id, messages)
+                    }
+                    editingMessage = null
                     pendingMessage = null
                     draft = ""; selected = null; uploaded = null; replyingTo = null; pendingId = ""; pendingSignature = ""
                 } catch (cancelled: CancellationException) { throw cancelled }
@@ -292,26 +363,33 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             itemsIndexed(messages.asReversed()) { index, message ->
                 val newer = if (index > 0) messages[messages.lastIndex - index + 1] else null
                 androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
-                    ChatMessage(message, maxWidth * .82f, media, audio, newer != null && newer.mine == message.mine && newer.time == message.time, onReply = { if (!saved) replyingTo = message }, peerName = person.name)
+                    ChatMessage(message, maxWidth * .82f, media, audio, newer != null && newer.mine == message.mine && newer.time == message.time, onReply = { if (!saved) replyingTo = message }, onLongPress = { messageActions = message }, onLocation = { openLocationMap(it) }, peerName = person.name)
                 }
             }
         }
 
         selected?.let { attachment ->
-            Row(Modifier.padding(horizontal=8.dp,vertical=3.dp).fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(chatSurface).padding(start=12.dp,top=5.dp,bottom=5.dp), verticalAlignment=Alignment.CenterVertically) {
+            Row(Modifier.padding(horizontal=8.dp,vertical=3.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(chatSurface).padding(start=7.dp,top=5.dp,bottom=5.dp), verticalAlignment=Alignment.CenterVertically) {
                 if (attachment.kind == "voice") Box(Modifier.weight(1f)) { AudioBubble(attachment,audio,if (dark) Color(0xFFE1E8ED) else Ink) }
-                else Column(Modifier.weight(1f)) { Text(attachment.name,maxLines=1,overflow=TextOverflow.Ellipsis,fontSize=12.sp,lineHeight=16.sp); Text(fileSize(attachment.size),fontSize=10.sp,lineHeight=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant) }
+                else {
+                    if (attachment.mime.startsWith("image/")) SelectedAttachmentPreview(attachment, media)
+                    Column(Modifier.weight(1f).padding(start=if (attachment.mime.startsWith("image/")) 8.dp else 2.dp)) {
+                        Text(attachment.name,maxLines=1,overflow=TextOverflow.Ellipsis,fontSize=12.sp,lineHeight=16.sp)
+                        Text(if(sending) "Загрузка ${(uploadProgress * 100).toInt().coerceIn(0,100)}%" else fileSize(attachment.size),fontSize=10.sp,lineHeight=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (sending) LinearProgressIndicator(progress={uploadProgress},modifier=Modifier.fillMaxWidth().padding(top=3.dp),color=Yellow,trackColor=Yellow.copy(alpha=.18f))
+                    }
+                }
                 ChatAction("close","Убрать вложение",enabled=!busy) { audio.stop(); scope.launch { media.removeLocal(attachment); selected=null; uploaded=null } }
             }
         }
-        replyingTo?.let { quote ->
+        (editingMessage ?: replyingTo)?.let { quote ->
             Row(Modifier.padding(horizontal = 8.dp, vertical = 2.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(chatSurface).padding(start = 10.dp, top = 5.dp, bottom = 5.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.width(2.dp).heightIn(min = 28.dp).background(Yellow))
                 Column(Modifier.weight(1f).padding(start = 8.dp)) {
-                    Text(if (quote.mine) "Ответ себе" else "Ответ ${person.name}", fontSize = 11.sp, lineHeight = 14.sp, color = if (dark) Yellow else Color(0xFF987400), fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(if (editingMessage != null) "Редактирование" else if (quote.mine) "Ответ себе" else "Ответ ${person.name}", fontSize = 11.sp, lineHeight = 14.sp, color = if (dark) Yellow else Color(0xFF987400), fontWeight = FontWeight.SemiBold, maxLines = 1)
                     Text(replyPreview(quote), fontSize = 12.sp, lineHeight = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                ChatAction("close", "Отменить ответ") { replyingTo = null }
+                ChatAction("close", "Отменить") { if(editingMessage!=null) { editingMessage=null; draft="" } else replyingTo = null }
             }
         }
         if (preparing || clearing) LinearProgressIndicator(Modifier.fillMaxWidth(),color=Yellow)
@@ -325,6 +403,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     Box(Modifier.size(6.dp).clip(CircleShape).background(Color(0xFFE46B64)))
                     Text(audioTime(recordTime),fontSize=14.sp,lineHeight=18.sp,modifier=Modifier.padding(horizontal=8.dp),color=if(dark) Color.White else Ink)
                     Waveform(liveLevels,0f,Yellow,Modifier.weight(1f).height(26.dp).padding(end=12.dp))
+                    ChatAction("stop","Завершить голосовую запись") { finishVoice() }
                 } else {
                     BasicTextField(draft,{draft=it.take(4000)},enabled=!busy,modifier=Modifier.weight(1f).padding(vertical=8.dp),textStyle=TextStyle(color=if(dark) Color(0xFFEEF2F5) else Ink,fontSize=15.sp,lineHeight=20.sp),cursorBrush=SolidColor(Yellow),maxLines=4,decorationBox={inner ->
                         if(draft.isEmpty()) Text(if(selected==null) "Сообщение" else "Подпись",color=MaterialTheme.colorScheme.onSurfaceVariant,fontSize=15.sp,lineHeight=20.sp,maxLines=1,overflow=TextOverflow.Ellipsis)
@@ -332,28 +411,18 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     })
                     Box {
                         ChatAction("attach","Прикрепить файл",enabled=!busy) { attachmentsMenu=true }
-                        DropdownMenu(attachmentsMenu,onDismissRequest={attachmentsMenu=false}) {
-                            DropdownMenuItem(text={Text("Фото и видео")},onClick={attachmentsMenu=false;pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))})
-                            DropdownMenuItem(text={Text("Файл")},onClick={attachmentsMenu=false;pickFile.launch(arrayOf("*/*"))})
-                            Text("До 25 МБ",modifier=Modifier.padding(horizontal=12.dp,vertical=6.dp),fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    val hasContent=draft.isNotBlank() || selected!=null
+                    val waiting=sending || preparing || clearing || startingVoice
+                    val action=if(waiting) "busy" else if(recording) "stop" else if(hasContent) "send" else "mic"
+                    Box(Modifier.padding(end=4.dp).size(34.dp).clip(CircleShape).background(Yellow.copy(alpha=if(waiting) .65f else 1f))
+                        .clickable(enabled=!waiting,role=Role.Button) {
+                            when(action) { "stop" -> finishVoice(); "send" -> send(); else -> if(androidx.core.content.ContextCompat.checkSelfPermission(context,android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED) startVoice() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO) }
+                        }.semantics { contentDescription=when(action){"mic"->"Записать голосовое";"stop"->"Остановить запись";"busy"->"Обработка сообщения";else->"Отправить"} },contentAlignment=Alignment.Center) {
+                        AnimatedContent(action,transitionSpec={ (fadeIn(tween(140))+scaleIn(initialScale=.6f,animationSpec=tween(160))) togetherWith (fadeOut(tween(90))+scaleOut(targetScale=.65f,animationSpec=tween(100))) },label="microphone-send") { mode ->
+                            if(mode=="busy") CircularProgressIndicator(Modifier.size(17.dp),strokeWidth=2.dp,color=Ink) else ChatGlyph(mode,Ink)
                         }
                     }
-                }
-            }
-            Spacer(Modifier.width(6.dp))
-            val hasContent=draft.isNotBlank() || selected!=null
-            val waiting=sending || preparing || clearing || startingVoice
-            val action=if(waiting) "busy" else if(recording) "stop" else if(hasContent) "send" else "mic"
-            Box(Modifier.size(40.dp).clip(CircleShape).background(Yellow.copy(alpha=if(waiting) .65f else 1f))
-                .clickable(enabled=!waiting,role=Role.Button) {
-                    when(action) {
-                        "stop" -> finishVoice()
-                        "send" -> send()
-                        else -> if(androidx.core.content.ContextCompat.checkSelfPermission(context,android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED) startVoice() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
-                    }
-                }.semantics { contentDescription=when(action){"mic"->"Записать голосовое";"stop"->"Остановить запись";"busy"->"Обработка сообщения";else->"Отправить"} },contentAlignment=Alignment.Center) {
-                AnimatedContent(action,transitionSpec={ (fadeIn(tween(140))+scaleIn(initialScale=.6f,animationSpec=tween(160))) togetherWith (fadeOut(tween(90))+scaleOut(targetScale=.65f,animationSpec=tween(100))) },label="microphone-send") { mode ->
-                    if(mode=="busy") CircularProgressIndicator(Modifier.size(19.dp),strokeWidth=2.dp,color=Ink) else ChatGlyph(mode,Ink)
                 }
             }
         }
@@ -391,9 +460,87 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         },
         confirmButton = { TextButton(onClick = { showWallpapers = false }) { Text("Готово") } }
     )
+
+    if (attachmentsMenu) ModalBottomSheet(onDismissRequest={attachmentsMenu=false}, containerColor=chatSurface) {
+        Text("Добавить",modifier=Modifier.padding(horizontal=20.dp,vertical=6.dp),fontSize=18.sp,fontWeight=FontWeight.SemiBold)
+        listOf("Фото / Видео","Файл","Геопозиция").forEachIndexed { index, title ->
+            ListItem(headlineContent={Text(title)}, supportingContent={Text(when(index){0->"Выбрать из галереи";1->"Документы и другие файлы";else->"Отправить место или делиться в реальном времени"})}, leadingContent={Text(when(index){0->"▧";1->"▤";else->"⌖"},fontSize=22.sp)}, modifier=Modifier.clickable {
+                attachmentsMenu=false
+                when(index){0->pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo));1->pickFile.launch(arrayOf("*/*"));else->showLocationOptions=true}
+            }, colors=ListItemDefaults.colors(containerColor=Color.Transparent))
+        }
+        Text("Файлы до 25 МБ",modifier=Modifier.padding(start=20.dp,bottom=24.dp),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+
+    if(showLocationOptions) AlertDialog(onDismissRequest={showLocationOptions=false},title={Text("Геопозиция")},text={
+        Column(verticalArrangement=Arrangement.spacedBy(8.dp)) {
+            Text("Отправь точку или показывай, где ты находишься. Живую передачу можно остановить в уведомлении.",fontSize=13.sp,lineHeight=18.sp)
+            OutlinedTextField(locationDuration,{locationDuration=it.filter(Char::isDigit).take(4)},label={Text("Время, минут")},supportingText={Text("От 15 минут до 1440 минут (24 часа)")},singleLine=true,keyboardOptions=androidx.compose.foundation.text.KeyboardOptions(keyboardType=androidx.compose.ui.text.input.KeyboardType.Number))
+        }
+    },confirmButton={Column(horizontalAlignment=Alignment.End) {
+        TextButton(onClick={runLocationAction("once")}) { Text("Отправить место сейчас") }
+        TextButton(onClick={runLocationAction("live")}) { Text("Начать передачу") }
+    }},dismissButton={TextButton(onClick={showLocationOptions=false}) { Text("Отмена") }})
+
+    messageActions?.let { target ->
+        ModalBottomSheet(onDismissRequest={messageActions=null},containerColor=chatSurface) {
+            Text("Сообщение",modifier=Modifier.padding(horizontal=20.dp,vertical=6.dp),fontSize=17.sp,fontWeight=FontWeight.SemiBold,maxLines=1,overflow=TextOverflow.Ellipsis)
+            ListItem(headlineContent={Text("Ответить")},leadingContent={Text("↩",fontSize=22.sp)},modifier=Modifier.clickable { replyingTo=target; editingMessage=null; messageActions=null },colors=ListItemDefaults.colors(containerColor=Color.Transparent))
+            ListItem(headlineContent={Text("Копировать")},leadingContent={Text("▢",fontSize=20.sp)},modifier=Modifier.clickable {
+                if(target.text.isNotBlank()) { val clipboard=context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager; clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Сообщение",target.text)) }
+                messageActions=null
+            },colors=ListItemDefaults.colors(containerColor=Color.Transparent))
+            if(target.mine && target.attachment==null) ListItem(headlineContent={Text("Редактировать")},leadingContent={Text("✎",fontSize=20.sp)},modifier=Modifier.clickable { editingMessage=target; replyingTo=null; draft=target.text; selected=null; uploaded=null; messageActions=null },colors=ListItemDefaults.colors(containerColor=Color.Transparent))
+            ListItem(headlineContent={Text("Удалить",color=MaterialTheme.colorScheme.error)},leadingContent={Text("⌫",fontSize=20.sp,color=MaterialTheme.colorScheme.error)},modifier=Modifier.clickable { confirmDeleteMessage=target; messageActions=null },colors=ListItemDefaults.colors(containerColor=Color.Transparent))
+            Spacer(Modifier.height(20.dp))
+        }
+    }
+
+    confirmDeleteMessage?.let { target ->
+        AlertDialog(onDismissRequest={confirmDeleteMessage=null},title={Text("Удалить сообщение?")},text={Text(if(target.mine) "Можно удалить только у себя или у обоих участников." else "Сообщение будет скрыто только у тебя.")},
+            confirmButton={Row { TextButton(onClick={
+                val snapshot=target; confirmDeleteMessage=null
+                scope.launch { try { if(!saved && snapshot.remoteId>0) directory.deleteMessage(snapshot.remoteId,false); messages=messages.filterNot { it.remoteId==snapshot.remoteId }; if(saved) store.saveMessages(person.id,messages) }
+                    catch(failure:Exception){sendError=(failure as? DirectoryException)?.message ?: "Не удалось удалить сообщение"} }
+            }) { Text("У себя") }; if(target.mine && !saved) TextButton(onClick={
+                val snapshot=target; confirmDeleteMessage=null
+                scope.launch { try { directory.deleteMessage(snapshot.remoteId,true); messages=messages.filterNot { it.remoteId==snapshot.remoteId } }
+                    catch(failure:Exception){sendError=(failure as? DirectoryException)?.message ?: "Не удалось удалить сообщение"} }
+            }) { Text("У всех") } } },dismissButton={TextButton(onClick={confirmDeleteMessage=null}) { Text("Отмена") }})
+    }
+}
+
+@Composable
+private fun SelectedAttachmentPreview(attachment: Attachment, media: MediaFiles) {
+    var bitmap by remember(attachment.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(attachment.id) { bitmap = runCatching { media.bitmap(attachment) }.getOrNull() }
+    Box(Modifier.size(48.dp).clip(RoundedCornerShape(10.dp)).background(Yellow.copy(alpha=.15f)),contentAlignment=Alignment.Center) {
+        bitmap?.let { Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop) } ?: Text("▧",fontSize=20.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 }
 
 private fun fileSize(bytes: Long): String = if (bytes >= 1024 * 1024) String.format(java.util.Locale.getDefault(), "%.1f МБ", bytes / (1024.0 * 1024.0)) else "${(bytes + 1023) / 1024} КБ"
+
+private suspend fun currentDeviceLocation(context: android.content.Context): android.location.Location = kotlinx.coroutines.withTimeout(15_000) {
+    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
+        val fine=androidx.core.content.ContextCompat.checkSelfPermission(context,android.Manifest.permission.ACCESS_FINE_LOCATION)==android.content.pm.PackageManager.PERMISSION_GRANTED
+        val coarse=androidx.core.content.ContextCompat.checkSelfPermission(context,android.Manifest.permission.ACCESS_COARSE_LOCATION)==android.content.pm.PackageManager.PERMISSION_GRANTED
+        if(!fine && !coarse) throw DirectoryException("Разреши доступ к геопозиции")
+        val manager=context.getSystemService(android.content.Context.LOCATION_SERVICE) as android.location.LocationManager
+        val providers=listOf(android.location.LocationManager.NETWORK_PROVIDER,android.location.LocationManager.GPS_PROVIDER).filter { runCatching { manager.isProviderEnabled(it) }.getOrDefault(false) }
+        val cached=providers.mapNotNull { runCatching { manager.getLastKnownLocation(it) }.getOrNull() }.maxByOrNull { it.time }
+        if(cached!=null && System.currentTimeMillis()-cached.time<120_000) return@withContext cached
+        val provider=providers.firstOrNull() ?: throw DirectoryException("Включи геолокацию на телефоне и попробуй снова")
+        kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            val listener=object:android.location.LocationListener {
+                override fun onLocationChanged(location:android.location.Location) { if(continuation.isActive) continuation.resumeWith(Result.success(location)) }
+            }
+            continuation.invokeOnCancellation { runCatching { manager.removeUpdates(listener) } }
+            try { manager.requestSingleUpdate(provider,listener,android.os.Looper.getMainLooper()) }
+            catch (_:SecurityException) { continuation.resumeWith(Result.failure(DirectoryException("Нет разрешения на геопозицию"))) }
+        }
+    }
+}
 
 private fun replyPreview(message: Message): String = message.text.ifBlank {
     when {
@@ -443,7 +590,11 @@ internal fun AttachmentBubble(attachment: Attachment, media: MediaFiles, content
             finally { loading = false }
         }
     }.padding(bottom = 3.dp)) {
-        if (bitmap != null) Image(bitmap!!.asImageBitmap(), contentDescription = attachment.name, modifier = Modifier.width(230.dp).heightIn(max = 240.dp).aspectRatio((bitmap!!.width.toFloat()/bitmap!!.height).coerceIn(.8f, 1.8f)).clip(RoundedCornerShape(10.dp)), contentScale = ContentScale.Crop)
+        if (bitmap != null) {
+            val ratio = (bitmap!!.width.toFloat() / bitmap!!.height.coerceAtLeast(1)).coerceIn(.48f, 2.05f)
+            val imageWidth = if (ratio < 1f) (240.dp * ratio).coerceAtLeast(132.dp) else (240.dp).coerceAtMost(240.dp * ratio)
+            Image(bitmap!!.asImageBitmap(), contentDescription = attachment.name, modifier = Modifier.width(imageWidth).heightIn(min = 132.dp, max = 320.dp).aspectRatio(ratio).clip(RoundedCornerShape(10.dp)), contentScale = ContentScale.Crop)
+        }
         else Row(Modifier.padding(vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
             if (loading) CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp, color = color)
             else Text(if (attachment.mime.startsWith("video/")) "▶" else "↓", fontSize = 24.sp, lineHeight = 28.sp, color = color)

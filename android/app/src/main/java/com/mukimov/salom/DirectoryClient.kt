@@ -15,7 +15,8 @@ import java.util.UUID
 
 internal class DirectoryException(message: String, val status: Int = 0) : Exception(message)
 internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
-internal data class MessageBatch(val messages: List<Message>, val receipts: Map<Long, String>, val hasMore: Boolean, val clearedThrough: Long)
+internal data class MessageEvent(val id: Long, val messageId: Long, val kind: String, val message: Message? = null)
+internal data class MessageBatch(val messages: List<Message>, val receipts: Map<Long, String>, val events: List<MessageEvent>, val hasMore: Boolean, val clearedThrough: Long)
 
 /** Private installation/session credential for the Salom API. Google sign-in uses AuthClient. */
 internal class DirectoryClient(context: Context) {
@@ -98,7 +99,7 @@ internal class DirectoryClient(context: Context) {
         (0 until array.length()).map { account(array.getJSONObject(it)) }
     }
 
-    private fun account(json: JSONObject) = SalomAccount(json.getString("id"), json.getString("name"), json.optString("username"), "", json.optBoolean("is_active"))
+    private fun account(json: JSONObject) = SalomAccount(json.getString("id"), json.getString("name"), json.optString("username"), "", json.optBoolean("is_active"), json.optString("avatar_url"))
 
     suspend fun sendMessage(peerId: String, text: String, clientId: String, attachment: Attachment? = null, replyToId: Long? = null): Message = withContext(Dispatchers.IO) {
         syncLocal()
@@ -121,13 +122,15 @@ internal class DirectoryClient(context: Context) {
         syncLocal(); request("typing?peer_id=" + URLEncoder.encode(peerId, "UTF-8")).optBoolean("typing")
     }
 
-    suspend fun messages(peerId: String, after: Long, receiptsAfter: Long = 0): MessageBatch = withContext(Dispatchers.IO) {
+    suspend fun messages(peerId: String, after: Long, receiptsAfter: Long = 0, eventsAfter: Long = 0): MessageBatch = withContext(Dispatchers.IO) {
         syncLocal()
-        val result = request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8") + "&after=$after&receipts_after=$receiptsAfter")
+        val result = request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8") + "&after=$after&receipts_after=$receiptsAfter&events_after=$eventsAfter")
         val array = result.getJSONArray("messages")
         val receiptArray = result.optJSONArray("receipts")
         val receipts = if (receiptArray == null) emptyMap() else (0 until receiptArray.length()).associate { index -> receiptArray.getJSONObject(index).getLong("id") to receiptArray.getJSONObject(index).optString("receipt", "sent") }
-        MessageBatch((0 until array.length()).map { message(array.getJSONObject(it)) }, receipts, result.optBoolean("has_more"), result.optLong("cleared_through"))
+        val eventsJson = result.optJSONArray("events")
+        val events = if (eventsJson == null) emptyList() else (0 until eventsJson.length()).map { i -> eventsJson.getJSONObject(i).let { MessageEvent(it.getLong("id"),it.getLong("message_id"),it.getString("kind"),it.optJSONObject("message")?.let(::message)) } }
+        MessageBatch((0 until array.length()).map { message(array.getJSONObject(it)) }, receipts, events, result.optBoolean("has_more"), result.optLong("cleared_through"))
     }
 
     suspend fun conversations(): List<ConversationPreview> = withContext(Dispatchers.IO) {
@@ -151,6 +154,18 @@ internal class DirectoryClient(context: Context) {
     suspend fun clearConversation(peerId: String): Long = withContext(Dispatchers.IO) {
         request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8"), method = "DELETE").getLong("cleared_through")
     }
+    suspend fun editMessage(id: Long, text: String): Message = withContext(Dispatchers.IO) { message(request("messages/$id", JSONObject().put("text",text), "PUT")) }
+    suspend fun deleteMessage(id: Long, everyone: Boolean) = withContext(Dispatchers.IO) { request("messages/$id?scope="+(if(everyone) "everyone" else "me"),method="DELETE"); Unit }
+    suspend fun startLiveLocation(peerId: String, minutes: Int): Pair<String,Message> = withContext(Dispatchers.IO) {
+        val result=request("locations",JSONObject().put("peer_id",peerId).put("duration_minutes",minutes),"POST")
+        result.getString("id") to message(result.getJSONObject("message"))
+    }
+    suspend fun sendLocationOnce(peerId:String,latitude:Double,longitude:Double):Message = withContext(Dispatchers.IO) {
+        message(request("locations/once",JSONObject().put("peer_id",peerId).put("latitude",latitude).put("longitude",longitude),"POST").getJSONObject("message"))
+    }
+    suspend fun updateLiveLocation(id:String,latitude:Double,longitude:Double) = withContext(Dispatchers.IO) { request("locations/$id",JSONObject().put("latitude",latitude).put("longitude",longitude),"PUT"); Unit }
+    suspend fun liveLocation(id:String):JSONObject = withContext(Dispatchers.IO) { request("locations/$id") }
+    suspend fun stopLiveLocation(id:String) = withContext(Dispatchers.IO) { request("locations/$id",method="DELETE"); Unit }
     private fun mediaConnection(path: String): HttpURLConnection = (URL("https://mukimov.site/salom/api/" + path).openConnection() as HttpURLConnection).apply {
         connectTimeout = 10000; readTimeout = 60000; instanceFollowRedirects = false
         setRequestProperty("Authorization", "Bearer $token")
@@ -160,13 +175,16 @@ internal class DirectoryClient(context: Context) {
         val detail = runCatching { JSONObject(body).optString("detail") }.getOrDefault("")
         throw DirectoryException(detail.ifBlank { "Не удалось передать файл. Попробуй снова" }, connection.responseCode)
     }
-    internal fun uploadAttachment(peer: String, attachment: Attachment, file: java.io.File): Attachment {
+    internal fun uploadAttachment(peer: String, attachment: Attachment, file: java.io.File, progress: (Float) -> Unit = {}): Attachment {
         val connection = mediaConnection("attachments?peer_id=" + URLEncoder.encode(peer, "UTF-8") + "&name=" + URLEncoder.encode(attachment.name, "UTF-8") + "&kind=" + attachment.kind + "&duration_ms=" + attachment.durationMs + "&waveform=" + URLEncoder.encode(attachment.waveform.joinToString(","), "UTF-8"))
         try {
             connection.requestMethod = "POST"; connection.doOutput = true
             connection.setRequestProperty("Content-Type", attachment.mime)
             connection.setFixedLengthStreamingMode(file.length())
-            connection.outputStream.use { output -> file.inputStream().use { it.copyTo(output, 64 * 1024) } }
+            connection.outputStream.use { output -> file.inputStream().use { input ->
+                val buffer = ByteArray(64 * 1024); var sent = 0L
+                while (true) { val count = input.read(buffer); if (count < 0) break; output.write(buffer, 0, count); sent += count; progress((sent.toFloat() / file.length()).coerceIn(0f, 1f)) }
+            } }
             if (connection.responseCode !in 200..299) mediaError(connection)
             return Attachment.from(JSONObject(connection.inputStream.bufferedReader().use { it.readText() }))
         } catch (failure: DirectoryException) { throw failure }
@@ -197,6 +215,6 @@ internal class DirectoryClient(context: Context) {
         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date((json.getDouble("created") * 1000).toLong()))
         val quote = json.optJSONObject("reply_to")
         val quoteSender = quote?.optString("sender_id")
-        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"), json.optJSONObject("attachment")?.let { Attachment.from(it) }, json.optString("receipt", "sent"), quote?.optLong("id")?.takeIf { it > 0 }, quoteSender?.let { if (it == ownId) "Вы" else "Собеседник" }, quote?.optString("text"))
+        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"), json.optJSONObject("attachment")?.let { Attachment.from(it) }, json.optString("receipt", "sent"), quote?.optLong("id")?.takeIf { it > 0 }, quoteSender?.let { if (it == ownId) "Вы" else "Собеседник" }, quote?.optString("text"), json.optDouble("edited_at",0.0)>0, json.optString("location_id").takeIf { it.isNotBlank() && it!="null" })
     }
 }

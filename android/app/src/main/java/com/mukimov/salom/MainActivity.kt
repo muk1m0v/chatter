@@ -39,6 +39,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.foundation.text.BasicTextField
@@ -59,8 +60,8 @@ import kotlinx.coroutines.launch
 internal val Yellow = Color(0xFFFFC400)
 internal val Ink = Color(0xFF25241F)
 private val Soft = Color(0xFFF5F5F3)
-internal data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "")
-internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0, val attachment: Attachment? = null, val receipt: String = "sent", val replyToId: Long? = null, val replyAuthor: String? = null, val replyPreview: String? = null)
+internal data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "", val avatarUrl: String = "")
+internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0, val attachment: Attachment? = null, val receipt: String = "sent", val replyToId: Long? = null, val replyAuthor: String? = null, val replyPreview: String? = null, val edited: Boolean = false, val locationId: String? = null)
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
 class MainActivity : ComponentActivity() {
@@ -151,7 +152,7 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
             try {
                 val account = directory.peer(notificationPeer)
                 tab = 0
-                activeChat = Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username)
+                activeChat = Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username, account.avatarUrl)
             } catch (exception: DirectoryException) {
                 android.widget.Toast.makeText(context, exception.message, android.widget.Toast.LENGTH_LONG).show()
             }
@@ -179,7 +180,7 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
             }
         }
     }
-    val openAccount: (SalomAccount) -> Unit = { account -> activeChat = if (account.id == "self") savedPerson else Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username) }
+    val openAccount: (SalomAccount) -> Unit = { account -> activeChat = if (account.id == "self") savedPerson else Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username, account.avatarUrl) }
     val scheme = if (dark) darkColorScheme(primary = Yellow, onPrimary = Ink, background = Color(0xFF171816), surface = Color(0xFF232420), secondaryContainer = Color(0xFF494125))
     else lightColorScheme(primary = Yellow, onPrimary = Ink, background = Soft, surface = Color.White, onSurface = Ink, secondaryContainer = Color(0xFFFFF0B2))
     SideEffect {
@@ -258,7 +259,16 @@ private fun Header(title: String, subtitle: String? = null, trailing: @Composabl
 
 @Composable
 private fun Avatar(person: Person, size: Int = 46) {
-    Box(Modifier.size(size.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) { Text(person.initials, color = Ink, fontSize = (size * .37).sp, fontWeight = FontWeight.SemiBold) }
+    var photo by remember(person.avatarUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(person.avatarUrl) {
+        photo = if(person.avatarUrl.startsWith("https://lh3.googleusercontent.com/") || person.avatarUrl.startsWith("https://googleusercontent.com/"))
+            runCatching { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { java.net.URL(person.avatarUrl).openConnection().apply { connectTimeout=4000; readTimeout=4000 }.getInputStream().use { android.graphics.BitmapFactory.decodeStream(it) } } }.getOrNull()
+        else null
+    }
+    Box(Modifier.size(size.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) {
+        if(photo!=null) androidx.compose.foundation.Image(photo!!.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=androidx.compose.ui.layout.ContentScale.Crop)
+        else Text(person.initials, color = Ink, fontSize = (size * .37).sp, fontWeight = FontWeight.SemiBold)
+    }
 }
 
 @Composable
@@ -303,7 +313,7 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
                 items(remoteChats, key = { it.account.id }, contentType = { "remote_chat" }) { conversation ->
                     val account = conversation.account
                     Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { onOpenAccount(account) }.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(Person(account.id, account.name, account.name.take(1).uppercase(), Color(0xFFFFE9A6), "", account.username))
+                        Avatar(Person(account.id, account.name, account.name.take(1).uppercase(), Color(0xFFFFE9A6), "", account.username, account.avatarUrl))
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(account.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -335,7 +345,7 @@ private fun Profile(store: Store, version: Int, directory: DirectoryClient, sync
     val scope = rememberCoroutineScope()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(16.dp))
-        Avatar(Person("me", name, name.take(1).uppercase(), Yellow, ""), 76)
+        Avatar(Person("me", name, name.take(1).uppercase(), Yellow, "", avatarUrl=store.text("avatar_url")), 76)
         Spacer(Modifier.height(12.dp))
         Text(name, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
         Text("Мой профиль", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)

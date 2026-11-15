@@ -3,7 +3,7 @@ package com.mukimov.salom
 import java.text.Normalizer
 import java.util.Locale
 
-internal data class SalomAccount(val id: String, val name: String, val username: String, val phone: String, val is_active: Boolean)
+internal data class SalomAccount(val id: String, val name: String, val username: String, val phone: String, val is_active: Boolean, val avatarUrl: String = "")
 internal enum class ContactDestination { CHAT, INVITE, UNKNOWN }
 internal fun contactDestination(account: SalomAccount?): ContactDestination = when {
     account == null -> ContactDestination.UNKNOWN
