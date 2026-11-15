@@ -38,7 +38,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS profiles (
           id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
           username TEXT, username_key TEXT UNIQUE, is_active INTEGER NOT NULL DEFAULT 1,
-          created REAL NOT NULL, updated REAL NOT NULL);
+          created REAL NOT NULL, updated REAL NOT NULL, online_at REAL NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS registrations (ip TEXT NOT NULL, at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS registrations_ip ON registrations(ip, at);
         CREATE TABLE IF NOT EXISTS messages (
@@ -46,6 +46,7 @@ def initialize():
           sender_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
           recipient_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
           client_id TEXT NOT NULL, text TEXT NOT NULL, created REAL NOT NULL,
+          delivered_at REAL, read_at REAL,
           UNIQUE(sender_id, client_id));
         CREATE INDEX IF NOT EXISTS messages_pair ON messages(sender_id, recipient_id, id);
         CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, id);
@@ -58,6 +59,11 @@ def initialize():
           next_at REAL NOT NULL DEFAULT 0, last_error TEXT);
         CREATE INDEX IF NOT EXISTS push_jobs_pending ON push_jobs(state,next_at);
         ''')
+        profile_columns = {row['name'] for row in db.execute('PRAGMA table_info(profiles)')}
+        if 'online_at' not in profile_columns: db.execute('ALTER TABLE profiles ADD COLUMN online_at REAL NOT NULL DEFAULT 0')
+        message_columns = {row['name'] for row in db.execute('PRAGMA table_info(messages)')}
+        if 'delivered_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN delivered_at REAL')
+        if 'read_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN read_at REAL')
         auth_schema(db)
         media.schema(db)
 
@@ -95,6 +101,12 @@ def digest(authorization):
 
 def public(row):
     return {'id': row['id'], 'name': row['name'], 'username': row['username'] or '', 'is_active': bool(row['is_active'])}
+
+def with_presence(row):
+    result = public(row)
+    seen = float(row['online_at'] or 0)
+    result.update({'is_online': seen >= time.time() - 45, 'last_seen': seen or None})
+    return result
 
 def throttle(key, limit=180):
     now = time.monotonic()
@@ -171,7 +183,8 @@ install_auth_routes(app, connect, current_profile, public, digest)
 media.install_routes(app, connect, current_profile)
 
 def message_json(row, db):
-    return {**{key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}, 'attachment': media.metadata(db, row['attachment_id'])}
+    receipt = 'read' if row['read_at'] else 'delivered' if row['delivered_at'] else 'sent'
+    return {**{key: row[key] for key in ('id', 'sender_id', 'recipient_id', 'text', 'created')}, 'receipt': receipt, 'attachment': media.metadata(db, row['attachment_id'])}
 
 class MessageInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -233,22 +246,38 @@ def get_profile(peer_id: str, authorization: str | None = Header(default=None)):
     with connect() as db:
         row = db.execute('SELECT * FROM profiles WHERE id=? AND is_active=1', (peer_id,)).fetchone()
         if not row: raise HTTPException(404, 'Профиль недоступен')
-        return public(row)
+        return with_presence(row)
+
+@app.post('/presence')
+def heartbeat(authorization: str | None = Header(default=None)):
+    me = current_profile(authorization)
+    now = time.time()
+    with connect() as db:
+        db.execute('UPDATE profiles SET online_at=? WHERE id=?', (now, me['id']))
+    return {'online': True, 'at': now}
 
 @app.get('/messages')
-def get_messages(peer_id: str, after: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
+def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_after: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
     me = current_profile(authorization)
     with connect() as db:
         cleared = media.cutoff(db, me['id'], peer_id)
+        now = time.time()
+        db.execute('UPDATE messages SET delivered_at=COALESCE(delivered_at,?) WHERE sender_id=? AND recipient_id=? AND id>?', (now, peer_id, me['id'], cleared))
+        db.execute('UPDATE messages SET read_at=COALESCE(read_at,?) WHERE sender_id=? AND recipient_id=? AND id>?', (now, peer_id, me['id'], cleared))
         rows = db.execute('''SELECT * FROM messages WHERE id>? AND
           ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))
           ORDER BY id LIMIT 100''', (max(after, cleared), me['id'], peer_id, peer_id, me['id'])).fetchall()
-        return {'messages': [message_json(row, db) for row in rows], 'has_more': len(rows) == 100, 'cleared_through': cleared}
+        receipts = db.execute('''SELECT id, CASE WHEN read_at IS NOT NULL THEN 'read' WHEN delivered_at IS NOT NULL THEN 'delivered' ELSE 'sent' END AS receipt
+          FROM messages WHERE sender_id=? AND recipient_id=? AND id>? ORDER BY id''', (me['id'], peer_id, max(receipts_after, cleared))).fetchall()
+        return {'messages': [message_json(row, db) for row in rows], 'receipts': [{'id': row['id'], 'receipt': row['receipt']} for row in receipts], 'has_more': len(rows) == 100, 'cleared_through': cleared}
 
 @app.get('/conversations')
 def conversations(authorization: str | None = Header(default=None)):
     me = current_profile(authorization)
     with connect() as db:
+        now = time.time()
+        db.execute('''UPDATE messages SET delivered_at=COALESCE(delivered_at,?) WHERE recipient_id=?
+          AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=messages.sender_id),0)''', (now, me['id'], me['id']))
         rows = db.execute('''WITH latest AS (
           SELECT CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS peer_id, MAX(id) AS last_id
           FROM messages WHERE (sender_id=? OR recipient_id=?) AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END),0) GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)

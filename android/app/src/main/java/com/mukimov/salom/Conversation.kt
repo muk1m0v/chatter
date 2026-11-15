@@ -8,6 +8,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -23,6 +25,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.paint
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -33,6 +36,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -51,7 +55,7 @@ import kotlinx.coroutines.launch
 import java.util.UUID
 
 @Composable
-internal fun Conversation(person: Person, store: Store, directory: DirectoryClient, onBack: () -> Unit) {
+internal fun Conversation(person: Person, store: Store, directory: DirectoryClient, wallpaperId: String, onWallpaperChange: (String) -> Unit, onBack: () -> Unit) {
     val saved = person.id == "saved"
     val context = LocalContext.current
     val media = remember(directory) { MediaFiles(context, directory) }
@@ -74,6 +78,9 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var attachmentsMenu by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     var connectionError by remember { mutableStateOf<String?>(null) }
+    var peerOnline by remember(person.id) { mutableStateOf(false) }
+    var pendingMessage by remember(person.id) { mutableStateOf<Message?>(null) }
+    var showWallpapers by remember { mutableStateOf(false) }
     var sendError by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(!saved) }
     var retry by remember { mutableIntStateOf(0) }
@@ -147,9 +154,11 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 while (isActive) {
                     try {
                         do {
-                            val batch = directory.messages(person.id, cursor)
+                            val receiptCursor = messages.filter { it.mine && it.remoteId > 0 }.minOfOrNull { it.remoteId } ?: 0L
+                            val batch = directory.messages(person.id, cursor, receiptCursor)
                             clearedThrough = maxOf(clearedThrough, batch.clearedThrough)
-                            messages = (messages + batch.messages).filter { it.remoteId > clearedThrough }.distinctBy { it.remoteId }.sortedBy { it.remoteId }
+                            val refreshed = messages.map { message -> if (message.mine) batch.receipts[message.remoteId]?.let { message.copy(receipt = it) } ?: message else message }
+                            messages = (refreshed.associateBy { it.remoteId } + batch.messages.associateBy { it.remoteId }).values.filter { it.remoteId > clearedThrough }.sortedBy { it.remoteId }
                             cursor = maxOf(cursor, clearedThrough, batch.messages.lastOrNull()?.remoteId ?: 0)
                         } while (batch.hasMore)
                         connectionError = null
@@ -158,6 +167,14 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     finally { loading = false }
                     delay(2500)
                 }
+            }
+        }
+    }
+    LaunchedEffect(person.id) {
+        if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isActive) {
+                try { peerOnline = directory.peerOnline(person.id) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { peerOnline = false }
+                delay(15_000)
             }
         }
     }
@@ -171,6 +188,8 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             val signature = text + ":" + attachment?.id.orEmpty()
             if (signature != pendingSignature || pendingId.isEmpty()) { pendingSignature = signature; pendingId = UUID.randomUUID().toString() }
             val clientId = pendingId
+            val sentAt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+            if (!saved) pendingMessage = Message(text, true, sentAt, attachment = attachment, receipt = "pending")
             scope.launch {
                 try {
                     val sent = if (saved) {
@@ -183,30 +202,38 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     }
                     messages = if (saved) messages + sent else (messages + sent).filter { it.remoteId > clearedThrough }.distinctBy { it.remoteId }.sortedBy { it.remoteId }
                     if (saved) store.saveMessages(person.id, messages)
+                    pendingMessage = null
                     draft = ""; selected = null; uploaded = null; pendingId = ""; pendingSignature = ""
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: Exception) { sendError = (failure as? DirectoryException)?.message ?: "Не удалось отправить. Попробуй снова" }
-                finally { sending = false }
+                finally { pendingMessage = null; sending = false }
             }
         }
     }
     val dark = MaterialTheme.colorScheme.background.red < .5f
     val background = if (dark) listOf(Color(0xFF111D27), Color(0xFF17232B)) else listOf(Color(0xFFF2F0E6), Color(0xFFECEEE6))
-    val wallpaper = remember(dark) { Modifier.chatWallpaper(dark) }
     val chatBackground = remember(dark) { Brush.verticalGradient(background) }
     val chatSurface = if (dark) Color(0xFF23303D) else Color.White
-    Column(Modifier.fillMaxSize().background(chatBackground).then(wallpaper)) {
-        Row(Modifier.padding(horizontal = 6.dp, vertical = 4.dp).fillMaxWidth().heightIn(min = 40.dp).clip(RoundedCornerShape(23.dp)).background(chatSurface), verticalAlignment = Alignment.CenterVertically) {
+    Column(Modifier.fillMaxSize().background(chatBackground).paint(painterResource(chatWallpaperResource(wallpaperId)), contentScale = ContentScale.Crop)) {
+        Row(Modifier.padding(horizontal = 6.dp, vertical = 5.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             ChatAction("back", "Назад", onClick = { if (recording || startingVoice) cancelVoice() else onBack() })
-            Box(Modifier.size(30.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) { Text(person.initials, color = Ink, fontWeight = FontWeight.Medium, fontSize = 14.sp) }
-            Spacer(Modifier.width(8.dp))
-            Column(Modifier.weight(1f).padding(vertical = 3.dp)) {
-                Text(person.name, fontSize = 14.sp, lineHeight = 17.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(if (saved) "Только для тебя" else "@${person.username}", fontSize = 10.sp, lineHeight = 13.sp, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(4.dp))
+            Row(Modifier.weight(1f).heightIn(min = 42.dp).clip(RoundedCornerShape(24.dp)).background(chatSurface).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(30.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) {
+                    Text(person.initials, color = Ink, fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                    if (!saved && peerOnline) Box(Modifier.align(Alignment.BottomEnd).size(9.dp).clip(CircleShape).background(Color(0xFF40D27A)).border(1.5.dp, chatSurface, CircleShape))
+                }
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f).padding(vertical = 3.dp)) {
+                    Text(person.name, fontSize = 14.sp, lineHeight = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(if (saved) "Только для тебя" else if (peerOnline) "в сети" else "не в сети", fontSize = 10.sp, lineHeight = 13.sp, maxLines = 1, color = if (peerOnline) Color(0xFF24B566) else MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
+            Spacer(Modifier.width(4.dp))
             Box {
-                ChatAction("menu", "Меню диалога", enabled = !busy) { menu = true }
+                Box(Modifier.size(40.dp).clip(CircleShape).background(chatSurface)) { ChatAction("menu", "Меню диалога", enabled = !busy) { menu = true } }
                 DropdownMenu(menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(text = { Text("Фон чата") }, onClick = { menu = false; showWallpapers = true })
                     DropdownMenuItem(text = { Text("Очистить диалог") }, onClick = { menu = false; confirmClear = true })
                 }
             }
@@ -219,13 +246,14 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 else { sendError = null; retry++ }
             }) { Text(if (micDenied) "Настройки" else "Повторить", fontSize = 11.sp) }
         }
-        if (messages.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+        if (messages.isEmpty() && pendingMessage == null) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             if (loading) CircularProgressIndicator(Modifier.size(24.dp), color = Yellow, strokeWidth = 2.dp)
             else Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(if (saved) "Избранное" else "Начни с «Салом»", fontSize = 18.sp, fontWeight = FontWeight.Medium)
                 Text(if (saved) "Сообщения и файлы для себя" else "Напиши сообщение или отправь фото", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp))
             }
         } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.Bottom)) {
+            item(key = "pending-message") { pendingMessage?.let { BoxWithConstraints(Modifier.fillMaxWidth()) { ChatMessage(it, maxWidth * .82f, media, audio, false) } } }
             itemsIndexed(messages.asReversed()) { index, message ->
                 val newer = if (index > 0) messages[messages.lastIndex - index + 1] else null
                 androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -242,9 +270,9 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             }
         }
         if (preparing || clearing) LinearProgressIndicator(Modifier.fillMaxWidth(),color=Yellow)
-        Row(Modifier.fillMaxWidth().padding(horizontal=7.dp,vertical=6.dp),verticalAlignment=Alignment.Bottom) {
+        Row(Modifier.fillMaxWidth().padding(horizontal=7.dp,vertical=5.dp),verticalAlignment=Alignment.Bottom) {
             val inputShape=RoundedCornerShape(24.dp)
-            Row(Modifier.weight(1f).heightIn(min=42.dp).clip(inputShape).background(chatSurface)
+            Row(Modifier.weight(1f).heightIn(min=40.dp).clip(inputShape).background(chatSurface)
                 .border(.7.dp,if (dark) Color.White.copy(alpha=.09f) else Color.Black.copy(alpha=.07f),inputShape)
                 .padding(start=if(recording) 0.dp else 14.dp),verticalAlignment=Alignment.CenterVertically) {
                 if (recording) {
@@ -271,7 +299,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             val hasContent=draft.isNotBlank() || selected!=null
             val waiting=sending || preparing || clearing || startingVoice
             val action=if(waiting) "busy" else if(recording) "stop" else if(hasContent) "send" else "mic"
-            Box(Modifier.size(42.dp).clip(CircleShape).background(Yellow.copy(alpha=if(waiting) .65f else 1f))
+            Box(Modifier.size(40.dp).clip(CircleShape).background(Yellow.copy(alpha=if(waiting) .65f else 1f))
                 .clickable(enabled=!waiting,role=Role.Button) {
                     when(action) {
                         "stop" -> finishVoice()
@@ -300,6 +328,24 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             }
         }) { Text("Очистить", color = MaterialTheme.colorScheme.error) }
     }, dismissButton = { TextButton(enabled = !clearing, onClick = { confirmClear = false }) { Text("Отмена") } })
+
+    if (showWallpapers) AlertDialog(
+        onDismissRequest = { showWallpapers = false },
+        title = { Text("Фон чата") },
+        text = {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                listOf("midnight" to "Ночь", "garden" to "Сад", "indigo" to "Индиго").forEach { (id, name) ->
+                    Column(Modifier.width(88.dp).clip(RoundedCornerShape(13.dp)).clickable {
+                        onWallpaperChange(id); showWallpapers = false
+                    }.padding(3.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Image(painterResource(chatWallpaperResource(id)), contentDescription = name, modifier = Modifier.fillMaxWidth().height(152.dp).clip(RoundedCornerShape(11.dp)).then(if (wallpaperId == id) Modifier.border(2.dp, Yellow, RoundedCornerShape(11.dp)) else Modifier), contentScale = ContentScale.Crop)
+                        Text(if (wallpaperId == id) "$name ✓" else name, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp), color = if (wallpaperId == id) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { showWallpapers = false }) { Text("Готово") } }
+    )
 }
 
 private fun fileSize(bytes: Long): String = if (bytes >= 1024 * 1024) String.format(java.util.Locale.getDefault(), "%.1f МБ", bytes / (1024.0 * 1024.0)) else "${(bytes + 1023) / 1024} КБ"

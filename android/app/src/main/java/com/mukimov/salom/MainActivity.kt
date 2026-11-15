@@ -34,6 +34,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.paint
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -42,6 +43,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -58,7 +60,7 @@ internal val Yellow = Color(0xFFFFC400)
 internal val Ink = Color(0xFF25241F)
 private val Soft = Color(0xFFF5F5F3)
 internal data class Person(val id: String, val name: String, val initials: String, val color: Color, val preview: String, val username: String = "")
-internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0, val attachment: Attachment? = null)
+internal data class Message(val text: String, val mine: Boolean, val time: String = "", val remoteId: Long = 0, val attachment: Attachment? = null, val receipt: String = "sent")
 private val savedPerson = Person("saved", "Избранное", "★", Yellow, "Сообщения и заметки для себя")
 
 class MainActivity : ComponentActivity() {
@@ -120,12 +122,14 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
     val directory = remember(credentialVersion) { DirectoryClient(context) }
     val store = remember { Store(context) }
     val appScope = rememberCoroutineScope()
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     var securingAccount by remember { mutableStateOf(false) }
     var directoryError by remember { mutableStateOf<String?>(null) }
     var signedIn by remember { mutableStateOf(store.text("signed_in") == "yes") }
     var dark by remember { mutableStateOf(store.text("dark") == "yes") }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var activeChat by remember { mutableStateOf<Person?>(null) }
+    var chatWallpaper by rememberSaveable { mutableStateOf(store.text("chat_wallpaper", "midnight")) }
     var profileVersion by remember { mutableIntStateOf(0) }
     val permission = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
@@ -159,20 +163,36 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
             }
         }
     }
+    LaunchedEffect(signedIn, directory) {
+        if (signedIn) {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (isActive) {
+                    try { directory.heartbeat() } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { }
+                    delay(20_000)
+                }
+            }
+        }
+    }
     val openAccount: (SalomAccount) -> Unit = { account -> activeChat = if (account.id == "self") savedPerson else Person(account.id, account.name, account.name.take(1).uppercase(), Yellow, "", account.username) }
     val scheme = if (dark) darkColorScheme(primary = Yellow, onPrimary = Ink, background = Color(0xFF171816), surface = Color(0xFF232420), secondaryContainer = Color(0xFF494125))
     else lightColorScheme(primary = Yellow, onPrimary = Ink, background = Soft, surface = Color.White, onSurface = Ink, secondaryContainer = Color(0xFFFFF0B2))
     SideEffect {
         (context as? ComponentActivity)?.window?.let { window ->
             WindowCompat.getInsetsController(window, window.decorView).apply {
-                isAppearanceLightStatusBars = !dark
-                isAppearanceLightNavigationBars = !dark
+                isAppearanceLightStatusBars = activeChat == null && !dark
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                if (android.os.Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
+                isAppearanceLightNavigationBars = activeChat == null && !dark
             }
         }
     }
     MaterialTheme(colorScheme = scheme, typography = Typography()) {
-        Surface(Modifier.fillMaxSize(), color = scheme.background) {
-          Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout)).imePadding()) {
+        Surface(Modifier.fillMaxSize().then(if (activeChat != null) Modifier.paint(androidx.compose.ui.res.painterResource(chatWallpaperResource(chatWallpaper)), contentScale = androidx.compose.ui.layout.ContentScale.Crop) else Modifier), color = if (activeChat != null) Color(0xFF101923) else scheme.background) {
+            Box(Modifier.fillMaxSize()
+                .then(if (activeChat != null) Modifier.background(if (dark) Color(0xFF101923) else Color(0xFFF2F0E6)) else Modifier)
+                .windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout)).imePadding()) {
             if (!signedIn || securingAccount) {
                 AuthScreen(context, directory, securingAccount, onSuccess = {
                     credentialVersion++; profileVersion++; directoryError = null; activeChat = null; signedIn = true; securingAccount = false
@@ -180,7 +200,7 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
             } else if (activeChat != null) {
                 BackHandler { activeChat = null }
                 key(activeChat!!.id) {
-                    Conversation(activeChat!!, store, directory) { activeChat = null }
+                    Conversation(activeChat!!, store, directory, chatWallpaper, { value -> chatWallpaper = value; store.save("chat_wallpaper", value) }) { activeChat = null }
                 }
             } else {
                 Scaffold(containerColor = scheme.background, contentWindowInsets = WindowInsets(0, 0, 0, 0), bottomBar = {

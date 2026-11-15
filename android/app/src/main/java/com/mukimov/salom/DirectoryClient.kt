@@ -15,7 +15,7 @@ import java.util.UUID
 
 internal class DirectoryException(message: String, val status: Int = 0) : Exception(message)
 internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
-internal data class MessageBatch(val messages: List<Message>, val hasMore: Boolean, val clearedThrough: Long)
+internal data class MessageBatch(val messages: List<Message>, val receipts: Map<Long, String>, val hasMore: Boolean, val clearedThrough: Long)
 
 /** Private installation/session credential for the Salom API. Google sign-in uses AuthClient. */
 internal class DirectoryClient(context: Context) {
@@ -105,11 +105,21 @@ internal class DirectoryClient(context: Context) {
         message(request("messages", JSONObject().put("recipient_id", peerId).put("text", text).put("client_id", clientId).apply { attachment?.let { put("attachment_id", it.id) } }, "POST"))
     }
 
-    suspend fun messages(peerId: String, after: Long): MessageBatch = withContext(Dispatchers.IO) {
+    suspend fun heartbeat() = withContext(Dispatchers.IO) {
+        syncLocal(); request("presence", JSONObject(), "POST"); Unit
+    }
+
+    suspend fun peerOnline(peerId: String): Boolean = withContext(Dispatchers.IO) {
+        syncLocal(); request("profiles/" + URLEncoder.encode(peerId, "UTF-8")).optBoolean("is_online")
+    }
+
+    suspend fun messages(peerId: String, after: Long, receiptsAfter: Long = 0): MessageBatch = withContext(Dispatchers.IO) {
         syncLocal()
-        val result = request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8") + "&after=$after")
+        val result = request("messages?peer_id=" + URLEncoder.encode(peerId, "UTF-8") + "&after=$after&receipts_after=$receiptsAfter")
         val array = result.getJSONArray("messages")
-        MessageBatch((0 until array.length()).map { message(array.getJSONObject(it)) }, result.optBoolean("has_more"), result.optLong("cleared_through"))
+        val receiptArray = result.optJSONArray("receipts")
+        val receipts = if (receiptArray == null) emptyMap() else (0 until receiptArray.length()).associate { index -> receiptArray.getJSONObject(index).getLong("id") to receiptArray.getJSONObject(index).optString("receipt", "sent") }
+        MessageBatch((0 until array.length()).map { message(array.getJSONObject(it)) }, receipts, result.optBoolean("has_more"), result.optLong("cleared_through"))
     }
 
     suspend fun conversations(): List<ConversationPreview> = withContext(Dispatchers.IO) {
@@ -177,6 +187,6 @@ internal class DirectoryClient(context: Context) {
 
     private fun message(json: JSONObject): Message {
         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date((json.getDouble("created") * 1000).toLong()))
-        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"), json.optJSONObject("attachment")?.let { Attachment.from(it) })
+        return Message(json.getString("text"), json.getString("sender_id") == ownId, time, json.getLong("id"), json.optJSONObject("attachment")?.let { Attachment.from(it) }, json.optString("receipt", "sent"))
     }
 }
