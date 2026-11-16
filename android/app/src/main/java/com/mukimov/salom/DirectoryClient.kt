@@ -1,22 +1,30 @@
 package com.mukimov.salom
 
 import android.content.Context
-import android.util.Base64
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import java.security.SecureRandom
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 internal class DirectoryException(message: String, val status: Int = 0) : Exception(message)
 internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
 internal data class MessageEvent(val id: Long, val messageId: Long, val kind: String, val message: Message? = null)
 internal data class MessageBatch(val messages: List<Message>, val receipts: Map<Long, String>, val events: List<MessageEvent>, val hasMore: Boolean, val clearedThrough: Long)
+internal data class RealtimeEvent(val type: String, val connected: Boolean = false, val online: Boolean? = null, val typing: Boolean? = null)
 
 /** Private installation/session credential for the Salom API. Google sign-in uses AuthClient. */
 internal class DirectoryClient(context: Context) {
@@ -25,17 +33,30 @@ internal class DirectoryClient(context: Context) {
     private val mutex = Mutex()
     private var syncedSignature: Pair<String, String>? = null
     val ownId: String = identity.getString("device_id", null) ?: UUID.randomUUID().toString().also { identity.edit().putString("device_id", it).commit() }
-    private val token: String = identity.getString("token", null) ?: ByteArray(32).also { SecureRandom().nextBytes(it) }.let { Base64.encodeToString(it, Base64.NO_WRAP or Base64.URL_SAFE or Base64.NO_PADDING) }.also { identity.edit().putString("token", it).commit() }
+    private val token: String = SecureTokenStore(context).readOrCreate()
+    private val realtimeClient = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(25, TimeUnit.SECONDS).build()
+    @Volatile private var activeRealtime: WebSocket? = null
     init {
+        val snapshot = identity.getString("auth_snapshot", null)?.let { raw ->
+            runCatching { JSONObject(raw) }.getOrNull()
+        }
+        snapshot?.let {
+            if (it.has("session_token")) {
+                it.remove("session_token")
+                check(identity.edit().putString("auth_snapshot", it.toString()).commit()) {
+                    "Не удалось безопасно обновить данные входа"
+                }
+            }
+        }
         // Recover the profile projection if the process stopped between the two preference writes.
         if (local.getString("owner_profile_id", "") != ownId) {
-            identity.getString("auth_snapshot", null)?.let { raw ->
+            snapshot?.let {
                 runCatching {
-                    val snapshot = JSONObject(raw)
-                    val profile = snapshot.getJSONObject("profile")
+                    val profile = it.getJSONObject("profile")
                     if (profile.getString("id") == ownId) local.edit().remove("about")
                         .putString("name", profile.getString("name")).putString("username", profile.getString("username"))
-                        .remove("phone").putString("email", snapshot.optString("email"))
+                        .remove("phone").putString("email", it.optString("email"))
                         .putString("owner_profile_id", ownId).putString("account_verified", "yes").putString("signed_in", "yes").commit()
                 }
             }
@@ -120,6 +141,29 @@ internal class DirectoryClient(context: Context) {
 
     suspend fun peerTyping(peerId: String): Boolean = withContext(Dispatchers.IO) {
         syncLocal(); request("typing?peer_id=" + URLEncoder.encode(peerId, "UTF-8")).optBoolean("typing")
+    }
+
+    fun realtime(peerId: String): Flow<RealtimeEvent> = callbackFlow {
+        val url = "wss://mukimov.site/salom/api/ws"
+        val request = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
+        val socket = realtimeClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                activeRealtime = webSocket
+                webSocket.send(JSONObject().put("type", "subscribe").put("peer_id", peerId).toString())
+            }
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                val data = runCatching { JSONObject(text) }.getOrNull() ?: return
+                val type = data.optString("type")
+                if (type in setOf("message", "typing", "presence", "sync", "ready", "subscribed")) trySend(RealtimeEvent(type, connected = type == "subscribed", online = data.optBoolean("online").takeIf { data.has("online") }, typing = data.optBoolean("typing").takeIf { data.has("typing") }))
+            }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (activeRealtime === webSocket) activeRealtime = null; trySend(RealtimeEvent("closed", connected = false)); close() }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { if (activeRealtime === webSocket) activeRealtime = null; trySend(RealtimeEvent("disconnected", connected = false)); close() }
+        })
+        awaitClose { if (activeRealtime === socket) activeRealtime = null; socket.close(1000, "Chat closed") }
+    }
+
+    fun sendRealtimeTyping(peerId: String, typing: Boolean) {
+        activeRealtime?.send(JSONObject().put("type", "typing").put("peer_id", peerId).put("typing", typing).toString())
     }
 
     suspend fun messages(peerId: String, after: Long, receiptsAfter: Long = 0, eventsAfter: Long = 0): MessageBatch = withContext(Dispatchers.IO) {

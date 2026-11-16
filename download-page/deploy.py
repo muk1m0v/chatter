@@ -9,7 +9,7 @@ import shutil
 import subprocess
 
 incoming = Path('/tmp/salom-deploy')
-apk = incoming / 'salom-0.14.7.apk'
+apk = incoming / 'salom-0.15.0.apk'
 assert apk.is_file() and apk.stat().st_size > 100_000
 assert (incoming / 'index.html').is_file()
 config = Path('/etc/nginx/sites-available/ryadom')
@@ -31,8 +31,8 @@ for filename in (apk.name, 'salom-latest.apk'):
     shutil.copy2(apk, temporary)
     temporary.chmod(0o644)
     temporary.replace(target / filename)
-metadata = {'version': '0.14.7', 'displayName': 'Faster', 'versionCode': 18, 'minSdk': 24, 'downloadUrl': 'https://mukimov.site/salom/' + apk.name, 'size': apk.stat().st_size, 'sha256': sha256,
-            'releaseNotes': ['Faster: новые сообщения обновляются каждые 1,5 секунды; статусы — каждые 5 секунд', 'Индикатор набора и список диалогов обновляются чаще', 'Добавлен индекс событий сообщений для более быстрой синхронизации', 'Включены вложения с предпросмотром, действия сообщений и геопозиция из версии 0.13.0']}
+metadata = {'version': '0.15.0', 'displayName': 'Real-Time', 'versionCode': 19, 'minSdk': 24, 'downloadUrl': 'https://mukimov.site/salom/' + apk.name, 'size': apk.stat().st_size, 'sha256': sha256,
+            'releaseNotes': ['Real-Time: открытые чаты получают сообщения, набор текста, статусы и изменения через WebSocket', 'При потере соединения включается HTTP-синхронизация и WebSocket переподключается', 'Android-токен переносится в Android Keystore', 'Предыдущие сообщения, вложения и FCM-уведомления остаются совместимыми']}
 for file in target.iterdir():
     if file.is_file(): file.chmod(0o644)
 new_config = config.read_text()
@@ -45,7 +45,7 @@ if marker in new_config:
 if marker not in new_config:
     routes = marker
     for filename in sorted(file.name for file in target.glob('salom-*.apk')):
-        download_name = 'salom-0.14.7.apk' if filename == 'salom-latest.apk' else filename
+        download_name = 'salom-0.15.0.apk' if filename == 'salom-latest.apk' else filename
         routes += f'''    location = /salom/{filename} {{
         alias /var/www/salom/{filename};
         default_type application/vnd.android.package-archive;

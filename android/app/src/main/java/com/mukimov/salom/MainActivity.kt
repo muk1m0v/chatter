@@ -276,11 +276,20 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
     var search by remember { mutableStateOf("") }
     var remoteChats by remember { mutableStateOf<List<ConversationPreview>>(emptyList()) }
     var inboxError by remember { mutableStateOf<String?>(null) }
+    val localCache = remember(context) { LocalChatCache(context) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(directory) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            remoteChats = localCache.conversations()
             while (isActive) {
-                try { remoteChats = directory.conversations(); inboxError = null }
+                try {
+                    val latest = directory.conversations()
+                    if (latest != remoteChats) {
+                        remoteChats = latest
+                        localCache.replaceConversations(latest)
+                    }
+                    inboxError = null
+                }
                 catch (exception: CancellationException) { throw exception }
                 catch (exception: DirectoryException) { inboxError = exception.message }
                 delay(3000)

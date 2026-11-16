@@ -1,37 +1,98 @@
 """Salom profiles, messaging and verified accounts. Address books are never collected."""
 import hashlib
 import hmac
+import asyncio
 import os
 import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 import media
+from database import INTEGRITY_ERRORS, PostgresConnection, create_pool
+from realtime import RealtimeHub
 from push import PushDispatcher
 from auth import schema as auth_schema, install_routes as install_auth_routes
 
 DB = Path(os.environ.get('SALOM_DB', '/var/lib/salom-api/directory.sqlite3'))
+PG_DSN = os.environ.get('SALOM_DATABASE_URL', '').strip()
+pg_pool = None
+pg_pool_lock = threading.Lock()
 USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9_]{3,23}$')
 TOKEN = re.compile(r'^[A-Za-z0-9_-]{43,128}$')
 rate_lock = threading.Lock()
 rates = defaultdict(deque)
 
+@contextmanager
 def connect():
+    if PG_DSN:
+        pool = get_pg_pool()
+        connection = pool.getconn()
+        try:
+            yield PostgresConnection(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            pool.putconn(connection)
+        return
     db = sqlite3.connect(DB, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
-    return db
+    try:
+        # sqlite3.Connection.__exit__ commits/rolls back but does not close the
+        # file descriptor. Every caller uses ``with connect()``; close it here
+        # so requests cannot accumulate database and WAL descriptors.
+        yield db
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+def get_pg_pool():
+    global pg_pool
+    if pg_pool is None:
+        with pg_pool_lock:
+            if pg_pool is None:
+                pg_pool = create_pool(PG_DSN)
+    return pg_pool
+
+def close_pg_pool():
+    global pg_pool
+    with pg_pool_lock:
+        if pg_pool is not None:
+            pg_pool.close(timeout=10)
+            pg_pool = None
 
 def initialize():
+    if PG_DSN:
+        required = {
+            'profiles': 'id,token_hash,name,username,username_key,is_active,created,updated,online_at,typing_to,typing_at,avatar_url',
+            'accounts': 'profile_id,firebase_uid,phone,email,password_hash,created,password_changed,google_linked',
+            'sessions': 'token_hash,profile_id,created,expires,verified_at',
+            'attachments': 'id,owner_id,peer_id,name,mime,size,created,ready,kind,duration_ms,waveform',
+            'messages': 'id,sender_id,recipient_id,client_id,text,created,delivered_at,read_at,reply_to_id,edited_at,location_id,attachment_id',
+            'message_events': 'id,message_id,sender_id,recipient_id,owner_id,kind',
+            'message_hides': 'owner_id,message_id', 'live_locations': 'id,owner_id,peer_id,created,expires,latitude,longitude,updated,active',
+            'conversation_clears': 'owner_id,peer_id,through_id', 'push_tokens': 'profile_id,token,updated',
+            'push_jobs': 'message_id,state,attempts,next_at,last_error', 'registrations': 'ip,at', 'auth_limits': 'key,at',
+        }
+        with connect() as db:
+            for table, columns in required.items():
+                db.execute(f'SELECT {columns} FROM {table} LIMIT 0')
+        return
     DB.parent.mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.executescript('''PRAGMA journal_mode=WAL;
@@ -81,12 +142,33 @@ def initialize():
 @asynccontextmanager
 async def lifespan(app):
     initialize()
+    app.state.realtime = RealtimeHub()
+    app.state.event_loop = asyncio.get_running_loop()
     app.state.push = PushDispatcher(connect)
     app.state.push.start()
     yield
     app.state.push.stop()
+    close_pg_pool()
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+def publish_realtime(profile_id: str, event: dict) -> None:
+    hub = getattr(app.state, 'realtime', None)
+    loop = getattr(app.state, 'event_loop', None)
+    if hub is None or loop is None or loop.is_closed():
+        return
+    def schedule_publish():
+        asyncio.create_task(hub.publish(profile_id, event))
+    loop.call_soon_threadsafe(schedule_publish)
+
+@app.websocket('/ws')
+async def realtime_socket(socket: WebSocket):
+    try:
+        profile = current_profile(socket.headers.get('authorization'))
+    except HTTPException:
+        await socket.close(code=4401, reason='Authentication required')
+        return
+    await app.state.realtime.serve(socket, profile['id'])
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exception):
@@ -166,7 +248,7 @@ def profile(body: ProfileInput, request: Request, authorization: str | None = He
             raise HTTPException(403, 'Подключи Google перед выбором нового username')
         try:
             db.execute('UPDATE profiles SET name=?,username=?,username_key=?,updated=? WHERE id=?', (name, username or None, username.lower() or None, now, body.device_id))
-        except sqlite3.IntegrityError:
+        except INTEGRITY_ERRORS:
             raise HTTPException(409, 'Этот username уже занят. Выбери другой')
         return public(db.execute('SELECT * FROM profiles WHERE id=?', (body.device_id,)).fetchone())
 
@@ -191,7 +273,7 @@ def current_profile(authorization):
         return dict(row)
 
 install_auth_routes(app, connect, current_profile, public, digest)
-media.install_routes(app, connect, current_profile)
+media.install_routes(app, connect, current_profile, throttle)
 
 def message_json(row, db):
     receipt = 'read' if row['read_at'] else 'delivered' if row['delivered_at'] else 'sent'
@@ -288,7 +370,11 @@ def edit_message(message_id: int, body: dict, authorization: str | None = Header
         if row['sender_id'] != me['id'] or row['attachment_id']: raise HTTPException(403, 'Можно изменить только своё текстовое сообщение')
         db.execute('UPDATE messages SET text=?,edited_at=? WHERE id=?', (text, time.time(), message_id))
         db.execute('INSERT INTO message_events(message_id,sender_id,recipient_id,kind) VALUES(?,?,?,\'edit\')', (message_id,row['sender_id'],row['recipient_id']))
-        return message_json(db.execute('SELECT * FROM messages WHERE id=?',(message_id,)).fetchone(),db)
+        result = message_json(db.execute('SELECT * FROM messages WHERE id=?',(message_id,)).fetchone(),db)
+        sender, recipient = row['sender_id'], row['recipient_id']
+    publish_realtime(recipient, {'type': 'sync', 'peer_id': sender})
+    publish_realtime(sender, {'type': 'sync', 'peer_id': recipient})
+    return result
 
 @app.delete('/messages/{message_id}')
 def delete_message(message_id: int, scope: str = Query(default='me', pattern='^(me|everyone)$'), authorization: str | None = Header(default=None)):
@@ -308,6 +394,12 @@ def delete_message(message_id: int, scope: str = Query(default='me', pattern='^(
         else:
             db.execute('INSERT OR IGNORE INTO message_hides(owner_id,message_id) VALUES(?,?)', (me['id'],message_id))
             db.execute('INSERT INTO message_events(message_id,sender_id,recipient_id,owner_id,kind) VALUES(?,?,?,?,\'hide\')', (message_id,sender,recipient,me['id']))
+    if scope == 'everyone':
+        publish_realtime(recipient, {'type': 'sync', 'peer_id': sender})
+        publish_realtime(sender, {'type': 'sync', 'peer_id': recipient})
+    else:
+        other = recipient if sender == me['id'] else sender
+        publish_realtime(me['id'], {'type': 'sync', 'peer_id': other})
     return {'deleted': True}
 
 class MessageInput(BaseModel):
@@ -328,6 +420,9 @@ def send_message(body: MessageInput, authorization: str | None = Header(default=
     text = body.text.strip()
     if not text and not body.attachment_id: raise HTTPException(400, 'Сообщение не может быть пустым')
     if body.recipient_id == me['id']: raise HTTPException(400, 'Для личных заметок используй Избранное')
+    # Per-account sliding window; the single-worker service shares this counter
+    # across all API routes. Move this limiter to Redis before adding workers.
+    throttle('send-message:' + me['id'], limit=60)
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if not db.execute('SELECT id FROM profiles WHERE id=? AND is_active=1', (body.recipient_id,)).fetchone():
@@ -349,8 +444,10 @@ def send_message(body: MessageInput, authorization: str | None = Header(default=
             if db.execute('SELECT 1 FROM messages WHERE attachment_id=?', (body.attachment_id,)).fetchone(): raise HTTPException(409, 'Вложение уже отправлено')
         cursor = db.execute('INSERT INTO messages(sender_id,recipient_id,client_id,text,created,attachment_id,reply_to_id) VALUES(?,?,?,?,?,?,?)', (me['id'], body.recipient_id, body.client_id, text, time.time(), body.attachment_id, body.reply_to_id))
         db.execute('INSERT INTO push_jobs(message_id) VALUES(?)', (cursor.lastrowid,))
-        app.state.push.wake.set()
-        return message_json(db.execute('SELECT * FROM messages WHERE id=?', (cursor.lastrowid,)).fetchone(), db)
+        outgoing = message_json(db.execute('SELECT * FROM messages WHERE id=?', (cursor.lastrowid,)).fetchone(), db)
+    app.state.push.wake.set()
+    publish_realtime(body.recipient_id, {'type': 'message', 'peer_id': me['id'], 'message': outgoing})
+    return outgoing
 
 class PushTokenInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -367,7 +464,7 @@ def register_push(body: PushTokenInput, authorization: str | None = Header(defau
             try:
                 db.execute('INSERT INTO push_tokens(profile_id,token,updated) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET token=excluded.token,updated=excluded.updated',
                            (me['id'], body.token, time.time()))
-            except sqlite3.IntegrityError:
+            except INTEGRITY_ERRORS:
                 raise HTTPException(409, 'Этот токен уже связан с другим профилем')
     return {'registered': body.enabled}
 
@@ -402,6 +499,7 @@ def set_typing(body: TypingInput, authorization: str | None = Header(default=Non
         if body.typing and not db.execute('SELECT 1 FROM profiles WHERE id=? AND is_active=1', (body.peer_id,)).fetchone():
             raise HTTPException(404, 'Собеседник недоступен')
         db.execute('UPDATE profiles SET typing_to=?,typing_at=? WHERE id=?', (body.peer_id if body.typing else None, time.time() if body.typing else 0, me['id']))
+    publish_realtime(body.peer_id, {'type': 'typing', 'peer_id': me['id'], 'typing': body.typing})
     return {'typing': body.typing}
 
 @app.get('/typing')
@@ -420,7 +518,7 @@ def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_aft
         cleared = media.cutoff(db, me['id'], peer_id)
         now = time.time()
         db.execute('UPDATE messages SET delivered_at=COALESCE(delivered_at,?) WHERE sender_id=? AND recipient_id=? AND id>?', (now, peer_id, me['id'], cleared))
-        db.execute('UPDATE messages SET read_at=COALESCE(read_at,?) WHERE sender_id=? AND recipient_id=? AND id>?', (now, peer_id, me['id'], cleared))
+        receipt_cursor = db.execute('UPDATE messages SET read_at=COALESCE(read_at,?) WHERE sender_id=? AND recipient_id=? AND id>? AND read_at IS NULL', (now, peer_id, me['id'], cleared))
         rows = db.execute('''SELECT * FROM messages WHERE id>? AND NOT EXISTS(SELECT 1 FROM message_hides h WHERE h.owner_id=? AND h.message_id=messages.id) AND
           ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))
           ORDER BY id LIMIT 100''', (max(after, cleared), me['id'], me['id'], peer_id, peer_id, me['id'])).fetchall()
@@ -434,7 +532,10 @@ def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_aft
                 current = db.execute('SELECT * FROM messages WHERE id=?',(event['message_id'],)).fetchone()
                 if current: change['message'] = message_json(current,db)
             changes.append(change)
-        return {'messages': [message_json(row, db) for row in rows], 'receipts': [{'id': row['id'], 'receipt': row['receipt']} for row in receipts], 'events': changes, 'has_more': len(rows) == 100, 'cleared_through': cleared}
+        payload = {'messages': [message_json(row, db) for row in rows], 'receipts': [{'id': row['id'], 'receipt': row['receipt']} for row in receipts], 'events': changes, 'has_more': len(rows) == 100, 'cleared_through': cleared}
+    if receipt_cursor.rowcount:
+        publish_realtime(peer_id, {'type': 'sync', 'peer_id': me['id']})
+    return payload
 
 @app.get('/conversations')
 def conversations(authorization: str | None = Header(default=None)):

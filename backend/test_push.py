@@ -34,7 +34,7 @@ class PushTests(unittest.TestCase):
         self.tokens = ['A' * 43, 'B' * 43]
         with app.connect() as db:
             for index in range(2):
-                db.execute('INSERT INTO profiles VALUES(?,?,?,?,?,1,?,?)', (self.ids[index], hashlib.sha256(self.tokens[index].encode()).hexdigest(), 'QA', 'qa' + str(index), 'qa' + str(index), time.time(), time.time()))
+                db.execute('INSERT INTO profiles(id,token_hash,name,username,username_key,is_active,created,updated) VALUES(?,?,?,?,?,1,?,?)', (self.ids[index], hashlib.sha256(self.tokens[index].encode()).hexdigest(), 'QA', 'qa' + str(index), 'qa' + str(index), time.time(), time.time()))
         app.register_push(app.PushTokenInput(token='fcm_' + 'x' * 64), 'Bearer ' + self.tokens[1])
 
     def tearDown(self): self.tmp.cleanup()

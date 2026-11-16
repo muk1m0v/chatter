@@ -56,8 +56,10 @@ import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.UUID
 
@@ -66,6 +68,7 @@ import java.util.UUID
 internal fun Conversation(person: Person, store: Store, directory: DirectoryClient, wallpaperId: String, onWallpaperChange: (String) -> Unit, onBack: () -> Unit) {
     val saved = person.id == "saved"
     val context = LocalContext.current
+    val localCache = remember(context) { LocalChatCache(context) }
     val media = remember(directory) { MediaFiles(context, directory) }
     val audio = remember(media) { ChatAudioPlayer(context, media) }
     val recorder = remember(media) { VoiceRecorder(context, media) }
@@ -76,6 +79,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var liveLevels by remember { mutableStateOf<List<Int>>(emptyList()) }
     var micDenied by remember { mutableStateOf(false) }
     var messages by remember(person.id) { mutableStateOf(if (saved) store.messages(person.id) else emptyList()) }
+    var cacheReady by remember(person.id) { mutableStateOf(saved) }
     var draft by remember(person.id) { mutableStateOf("") }
     var selected by remember { mutableStateOf<Attachment?>(null) }
     var uploaded by remember { mutableStateOf<Attachment?>(null) }
@@ -92,11 +96,13 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var connectionError by remember { mutableStateOf<String?>(null) }
     var peerOnline by remember(person.id) { mutableStateOf(false) }
     var peerTyping by remember(person.id) { mutableStateOf(false) }
+    var realtimeConnected by remember(person.id) { mutableStateOf(false) }
     var replyingTo by remember(person.id) { mutableStateOf<Message?>(null) }
     var messageActions by remember { mutableStateOf<Message?>(null) }
     var confirmDeleteMessage by remember { mutableStateOf<Message?>(null) }
     var editingMessage by remember(person.id) { mutableStateOf<Message?>(null) }
     var pendingMessage by remember(person.id) { mutableStateOf<Message?>(null) }
+    var queuedOutgoing by remember(person.id) { mutableStateOf<List<CachedOutgoing>>(emptyList()) }
     var showWallpapers by remember { mutableStateOf(false) }
     var sendError by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(!saved) }
@@ -105,6 +111,10 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var pendingSignature by remember { mutableStateOf("") }
     var pendingId by remember { mutableStateOf("") }
     var eventCursor by remember(person.id) { mutableLongStateOf(0L) }
+    var messageCursor by remember(person.id) { mutableLongStateOf(0L) }
+    val latestMessages by rememberUpdatedState(messages)
+    val latestOutgoing by rememberUpdatedState(queuedOutgoing)
+    val latestSending by rememberUpdatedState(sending)
     val scope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val listState = rememberLazyListState()
@@ -112,6 +122,37 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     fun cancelVoice() { voiceGeneration++; recorder.cancel(); recording = false; startingVoice = false; recordTime = 0; liveLevels = emptyList() }
+
+    suspend fun attemptQueued(item: CachedOutgoing, sendingClaimed: Boolean = false): Boolean {
+        if (saved || (!sendingClaimed && sending)) return false
+        if (!sendingClaimed) sending = true
+        try {
+            val attachment = item.attachment()
+            val remoteAttachment = if (attachment != null) {
+                uploadProgress = 0f
+                media.upload(person.id, attachment) { uploadProgress = it }
+            } else null
+            val sent = directory.sendMessage(person.id, item.text, item.clientId, remoteAttachment, item.replyToId)
+            localCache.upsertMessages(person.id, listOf(sent))
+            localCache.removeQueued(item.clientId)
+            queuedOutgoing = queuedOutgoing.filterNot { it.clientId == item.clientId }
+            messages = (messages + sent).filter { it.remoteId > clearedThrough }.distinctBy { it.remoteId }.sortedBy { it.remoteId }
+            attachment?.let { media.removeLocal(it) }
+            if (pendingId == item.clientId) {
+                draft = ""; selected = null; uploaded = null; replyingTo = null; pendingId = ""; pendingSignature = ""
+            }
+            sendError = null
+            return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            sendError = (failure as? DirectoryException)?.message ?: "Сообщение сохранено и отправится, когда связь восстановится"
+            return false
+        } finally {
+            sending = false
+            pendingMessage = null
+        }
+    }
     fun startVoice() {
         if (busy || draft.isNotBlank() || selected != null) return
         audio.stop(); focusManager.clearFocus(); keyboard?.hide(); sendError = null; micDenied = false
@@ -191,10 +232,12 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     val location=currentDeviceLocation(context)
                     if(action=="once") {
                         val sent=directory.sendLocationOnce(person.id,location.latitude,location.longitude)
+                        runCatching { localCache.upsertMessages(person.id, listOf(sent)) }
                         messages=(messages+sent).distinctBy { it.remoteId }.sortedBy { it.remoteId }
                     } else {
                         val minutes=locationDuration.toIntOrNull()?.takeIf { it in 15..1440 } ?: throw DirectoryException("Укажи время от 15 до 1440 минут")
                         val (id,message)=directory.startLiveLocation(person.id,minutes)
+                        runCatching { localCache.upsertMessages(person.id, listOf(message)) }
                         messages=(messages+message).distinctBy { it.remoteId }.sortedBy { it.remoteId }
                         val service=android.content.Intent(context,LiveLocationService::class.java).putExtra(LiveLocationService.EXTRA_ID,id).putExtra(LiveLocationService.EXTRA_PEER,person.name).putExtra(LiveLocationService.EXTRA_EXPIRES,System.currentTimeMillis()+minutes*60_000L)
                         androidx.core.content.ContextCompat.startForegroundService(context,service)
@@ -214,47 +257,109 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
 
     LaunchedEffect(person.id) { if (!saved) PushNotifications.cancelChat(context, person.id) }
 
-    LaunchedEffect(person.id, retry) {
+    LaunchedEffect(person.id) {
         if (!saved) {
-            var cursor = clearedThrough
+            queuedOutgoing = localCache.queuedMessages(person.id)
+            val state = localCache.chatState(person.id)
+            val cachedMessages = localCache.messages(person.id)
+            messages = cachedMessages
+            messageCursor = state?.messageCursor ?: cachedMessages.maxOfOrNull { it.remoteId } ?: 0L
+            eventCursor = state?.eventCursor ?: 0L
+            clearedThrough = state?.clearedThrough ?: 0L
+            cacheReady = true
+        }
+    }
+
+    LaunchedEffect(person.id, cacheReady) {
+        if (!saved && cacheReady) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var backoff = 1_000L
+            while (isActive) {
+                val queued = latestOutgoing.firstOrNull()
+                if (queued != null && !latestSending) {
+                    if (attemptQueued(queued)) backoff = 1_000L else backoff = (backoff * 2).coerceAtMost(30_000L)
+                }
+                delay(backoff)
+            }
+        }
+    }
+
+    LaunchedEffect(person.id, retry, cacheReady) {
+        if (!saved && cacheReady) {
+            var cursor = maxOf(messageCursor, clearedThrough)
             lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
                 while (isActive) {
                     try {
                         do {
-                            val receiptCursor = messages.filter { it.mine && it.remoteId > 0 }.minOfOrNull { it.remoteId } ?: 0L
+                            val receiptCursor = latestMessages.filter { it.mine && it.remoteId > 0 }.minOfOrNull { it.remoteId } ?: 0L
                             val batch = directory.messages(person.id, cursor, receiptCursor, eventCursor)
                             clearedThrough = maxOf(clearedThrough, batch.clearedThrough)
-                            val refreshed = messages.map { message -> if (message.mine) batch.receipts[message.remoteId]?.let { message.copy(receipt = it) } ?: message else message }
+                            val refreshed = latestMessages.map { message -> if (message.mine) batch.receipts[message.remoteId]?.let { message.copy(receipt = it) } ?: message else message }
                             val merged = (refreshed.associateBy { it.remoteId } + batch.messages.associateBy { it.remoteId }).toMutableMap()
+                            val changed = batch.messages.toMutableList()
+                            val deletedIds = mutableListOf<Long>()
                             batch.events.forEach { event ->
                                 when(event.kind) {
-                                    "edit" -> event.message?.let { merged[it.remoteId] = it }
-                                    "delete", "hide" -> merged.remove(event.messageId)
+                                    "edit" -> event.message?.let { merged[it.remoteId] = it; changed += it }
+                                    "delete", "hide" -> { merged.remove(event.messageId); deletedIds += event.messageId }
                                 }
                             }
-                            messages = merged.values.filter { it.remoteId > clearedThrough }.sortedBy { it.remoteId }
+                            val receiptUpdates = latestMessages.mapNotNull { old ->
+                                batch.receipts[old.remoteId]?.takeIf { it != old.receipt }?.let { old.copy(receipt = it) }
+                            }
+                            changed += receiptUpdates
                             eventCursor = maxOf(eventCursor, batch.events.lastOrNull()?.id ?: eventCursor)
                             cursor = maxOf(cursor, clearedThrough, batch.messages.lastOrNull()?.remoteId ?: 0)
+                            messageCursor = maxOf(messageCursor, cursor)
+                            localCache.applySync(person.id, changed, deletedIds, messageCursor, eventCursor, clearedThrough)
+                            messages = merged.values.filter { it.remoteId > clearedThrough }.sortedBy { it.remoteId }
                         } while (batch.hasMore)
                         connectionError = null
                     } catch (cancelled: CancellationException) { throw cancelled }
                     catch (failure: DirectoryException) { connectionError = failure.message }
                     finally { loading = false }
-                    delay(1500)
+                        if (realtimeConnected) awaitCancellation() else delay(1500)
                 }
             }
         }
     }
     LaunchedEffect(person.id) {
         if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var backoff = 1_000L
+            while (isActive) {
+                try {
+                    directory.realtime(person.id).collect { event ->
+                        if (event.connected) {
+                            realtimeConnected = true
+                            backoff = 1_000L
+                            retry++ // Fetch anything missed before the socket became ready.
+                        } else when (event.type) {
+                            "message", "sync" -> retry++
+                            "typing" -> peerTyping = event.typing ?: false
+                            "presence" -> { peerOnline = event.online ?: false; retry++ }
+                            "closed", "disconnected" -> { realtimeConnected = false; retry++ }
+                        }
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { }
+                realtimeConnected = false
+                retry++
+                delay(backoff)
+                backoff = (backoff * 2).coerceAtMost(30_000L)
+            }
+        }
+    }
+    LaunchedEffect(person.id, realtimeConnected) {
+        if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            if (realtimeConnected) awaitCancellation()
             while (isActive) {
                 try { peerOnline = directory.peerOnline(person.id) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { peerOnline = false }
                 delay(5_000)
             }
         }
     }
-    LaunchedEffect(person.id) {
+    LaunchedEffect(person.id, realtimeConnected) {
         if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            if (realtimeConnected) awaitCancellation()
             while (isActive) {
                 try { peerTyping = directory.peerTyping(person.id) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { peerTyping = false }
                 delay(1_000)
@@ -263,7 +368,8 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     }
     LaunchedEffect(person.id) {
         if (!saved) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            snapshotFlow { draft.isNotBlank() }.distinctUntilChanged().collectLatest { typing ->
+            snapshotFlow { draft.isNotBlank() to realtimeConnected }.distinctUntilChanged().collectLatest { (typing, connected) ->
+                if (connected) { directory.sendRealtimeTyping(person.id, typing); return@collectLatest }
                 if (typing) {
                     while (true) {
                         try { directory.setTyping(person.id, true) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { }
@@ -291,22 +397,26 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 try {
                     if (editing != null && !saved) {
                         val changed = directory.editMessage(editing.remoteId, text)
+                        runCatching { localCache.upsertMessages(person.id, listOf(changed)) }
                         messages = messages.map { if (it.remoteId == changed.remoteId) changed else it }
-                    } else {
-                    val sent = if (saved) {
+                    } else if (saved) {
                         val local = attachment?.let { media.saveLocal(it) }
                         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-                        Message(text, true, time, attachment = local)
+                        val sent = Message(text, true, time, attachment = local)
+                        messages = messages + sent
+                        store.saveMessages(person.id, messages)
                     } else {
-                        if (attachment != null && uploaded == null) { uploadProgress = 0f; uploaded = media.upload(person.id, attachment) { uploadProgress = it } }
-                        directory.sendMessage(person.id, text, clientId, uploaded, quote?.remoteId)
+                        val queuedAttachment = attachment?.let { media.persistForQueue(it) }
+                        val queued = CachedOutgoing.create(clientId, person.id, text, System.currentTimeMillis(), queuedAttachment, quote?.remoteId, if (quote?.mine == true) "Вы" else person.name, quote?.let(::replyPreview))
+                        localCache.enqueue(queued)
+                        queuedOutgoing = localCache.queuedMessages(person.id)
+                        attemptQueued(queued, sendingClaimed = true)
                     }
-                    messages = if (saved) messages + sent else (messages + sent).filter { it.remoteId > clearedThrough }.distinctBy { it.remoteId }.sortedBy { it.remoteId }
-                    if (saved) store.saveMessages(person.id, messages)
+                    if (saved || editing != null) {
+                        editingMessage = null
+                        pendingMessage = null
+                        draft = ""; selected = null; uploaded = null; replyingTo = null; pendingId = ""; pendingSignature = ""
                     }
-                    editingMessage = null
-                    pendingMessage = null
-                    draft = ""; selected = null; uploaded = null; replyingTo = null; pendingId = ""; pendingSignature = ""
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: Exception) { sendError = (failure as? DirectoryException)?.message ?: "Не удалось отправить. Попробуй снова" }
                 finally { pendingMessage = null; sending = false }
@@ -352,7 +462,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 else { sendError = null; retry++ }
             }) { Text(if (micDenied) "Настройки" else "Повторить", fontSize = 11.sp) }
         }
-        if (messages.isEmpty() && pendingMessage == null) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+        if (messages.isEmpty() && pendingMessage == null && queuedOutgoing.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             if (loading) CircularProgressIndicator(Modifier.size(24.dp), color = Yellow, strokeWidth = 2.dp)
             else Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(if (saved) "Избранное" else "Начни с «Салом»", fontSize = 18.sp, fontWeight = FontWeight.Medium)
@@ -360,6 +470,11 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             }
         } else LazyColumn(state = listState, reverseLayout = true, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.Bottom)) {
             item(key = "pending-message") { pendingMessage?.let { BoxWithConstraints(Modifier.fillMaxWidth()) { ChatMessage(it, maxWidth * .82f, media, audio, false) } } }
+            items(queuedOutgoing.asReversed(), key = { "queued-${it.clientId}" }) { queued ->
+                BoxWithConstraints(Modifier.fillMaxWidth()) {
+                    ChatMessage(queued.toMessage(), maxWidth * .82f, media, audio, false, peerName = person.name)
+                }
+            }
             itemsIndexed(messages.asReversed()) { index, message ->
                 val newer = if (index > 0) messages[messages.lastIndex - index + 1] else null
                 androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -434,7 +549,18 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             scope.launch {
                 try {
                     if (saved) { val removed = messages; kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { store.clearMessages(person.id) }; messages = emptyList(); removed.forEach { it.attachment?.let { attachment -> media.removeLocal(attachment) } } }
-                    else { clearedThrough = maxOf(clearedThrough, directory.clearConversation(person.id)); val old = messages.filter { it.remoteId <= clearedThrough }; messages = messages.filter { it.remoteId > clearedThrough }; old.forEach { it.attachment?.let { attachment -> media.removeLocal(attachment) } }; retry++ }
+                    else {
+                        clearedThrough = maxOf(clearedThrough, directory.clearConversation(person.id))
+                        runCatching { localCache.deleteThrough(person.id, clearedThrough) }
+                        val queued = localCache.queuedMessages(person.id)
+                        localCache.clearQueued(person.id)
+                        queuedOutgoing = emptyList()
+                        queued.mapNotNull { it.attachment() }.forEach { media.removeLocal(it) }
+                        val old = messages.filter { it.remoteId <= clearedThrough }
+                        messages = messages.filter { it.remoteId > clearedThrough }
+                        old.forEach { it.attachment?.let { attachment -> media.removeLocal(attachment) } }
+                        retry++
+                    }
                     confirmClear = false
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: Exception) { sendError = (failure as? DirectoryException)?.message ?: "Не удалось очистить диалог"; confirmClear = false }

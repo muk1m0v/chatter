@@ -17,6 +17,7 @@ from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token
 from pydantic import BaseModel, ConfigDict, Field
 import requests
+from database import INTEGRITY_ERRORS
 
 USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9_]{3,23}$')
 EMAIL = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
@@ -139,7 +140,7 @@ def install_routes(app, connect, current_profile, public, digest):
                     if not proof.username: return {'needs_username': True}
                     if not USERNAME.fullmatch(proof.username): raise HTTPException(400, 'Проверь username')
                     try: db.execute('UPDATE profiles SET username=?,username_key=?,updated=? WHERE id=?', (proof.username, proof.username.lower(), now, target))
-                    except sqlite3.IntegrityError: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
+                    except INTEGRITY_ERRORS: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
             elif existing:
                 if contact['avatar_url']:
                     db.execute('UPDATE profiles SET avatar_url=? WHERE id=?', (contact['avatar_url'], existing['profile_id']))
@@ -157,13 +158,13 @@ def install_routes(app, connect, current_profile, public, digest):
                 target = str(uuid.uuid4())
                 try:
                     db.execute('INSERT INTO profiles(id,token_hash,name,username,username_key,is_active,created,updated) VALUES(?,?,?,?,?,1,?,?)', (target, hash_token(secrets.token_urlsafe(32)), name, proof.username, proof.username.lower(), now, now))
-                except sqlite3.IntegrityError: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
+                except INTEGRITY_ERRORS: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
             try:
                 if contact['avatar_url']:
                     db.execute('UPDATE profiles SET avatar_url=? WHERE id=?', (contact['avatar_url'], target))
                 db.execute('INSERT INTO accounts(profile_id,firebase_uid,email,created,google_linked) VALUES(?,?,?,?,1) ON CONFLICT(profile_id) DO UPDATE SET firebase_uid=excluded.firebase_uid,email=excluded.email,google_linked=1',
                            (target, contact['firebase_uid'], contact['email'], now))
-            except sqlite3.IntegrityError: raise HTTPException(409, 'Google уже связан с другим аккаунтом')
+            except INTEGRITY_ERRORS: raise HTTPException(409, 'Google уже связан с другим аккаунтом')
             # Upgrade ownership without changing profile ID or its message history.
             db.execute('UPDATE profiles SET token_hash=? WHERE id=?', (hash_token(secrets.token_urlsafe(32)), target))
             return session(db, target)

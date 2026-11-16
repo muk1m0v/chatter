@@ -37,7 +37,7 @@ internal class AppUpdater(application: Application) : AndroidViewModel(applicati
     val installedVersion: String = packageInfo.versionName.orEmpty()
     @Suppress("DEPRECATION")
     val installedCode = if (Build.VERSION.SDK_INT >= 28) packageInfo.longVersionCode else packageInfo.versionCode.toLong()
-    val installedDisplayVersion: String = if (installedVersion == "0.14.7") "$installedVersion Faster" else installedVersion
+    val installedDisplayVersion: String = if (installedVersion == "0.15.0") "$installedVersion Real-Time" else installedVersion
     private val mutableStatus = MutableStateFlow<UpdateStatus>(UpdateStatus.Unchecked)
     val status = mutableStatus.asStateFlow()
     private var job: Job? = null

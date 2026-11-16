@@ -75,6 +75,13 @@ internal class MediaFiles(private val context: Context, private val directory: D
         target(attachment).copyTo(target(result), overwrite = true)
         result
     }
+    suspend fun persistForQueue(attachment: Attachment): Attachment = withContext(Dispatchers.IO) {
+        val result = attachment.copy(local = true)
+        val source = target(attachment)
+        if (!source.isFile) throw DirectoryException("Файл вложения уже недоступен")
+        source.copyTo(target(result), overwrite = true)
+        result
+    }
     suspend fun file(attachment: Attachment): File = withContext(Dispatchers.IO) {
         lock.withLock {
             val file = target(attachment)

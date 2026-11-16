@@ -19,6 +19,7 @@ coverage/
 dist/
 # Android / Gradle generated and machine-specific files
 .gradle/
+.gradle-home/
 .kotlin/
 build/
 local.properties

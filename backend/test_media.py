@@ -22,7 +22,7 @@ class MediaTests(unittest.TestCase):
         self.ids, self.tokens = [str(uuid.uuid4()) for _ in range(3)], [secrets.token_urlsafe(32) for _ in range(3)]
         with app.connect() as db:
             for index in range(3):
-                db.execute('INSERT INTO profiles VALUES(?,?,?,?,?,1,?,?)', (self.ids[index], hashlib.sha256(self.tokens[index].encode()).hexdigest(), 'Media QA', 'qa'+str(index), 'qa'+str(index), time.time(), time.time()))
+                db.execute('INSERT INTO profiles(id,token_hash,name,username,username_key,is_active,created,updated) VALUES(?,?,?,?,?,1,?,?)', (self.ids[index], hashlib.sha256(self.tokens[index].encode()).hexdigest(), 'Media QA', 'qa'+str(index), 'qa'+str(index), time.time(), time.time()))
     def tearDown(self):
         self.client.__exit__(None, None, None); self.push.stop()
         app.DB, media.ROOT = self.old_db, self.old_root

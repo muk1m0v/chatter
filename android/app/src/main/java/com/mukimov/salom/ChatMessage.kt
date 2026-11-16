@@ -97,6 +97,7 @@ private fun MessageMeta(time: String, receipt: String, mine: Boolean, dark: Bool
             Spacer(Modifier.width(3.dp))
             when (receipt) {
                 "pending" -> androidx.compose.material3.CircularProgressIndicator(Modifier.size(9.dp), strokeWidth = 1.dp, color = contentColor.copy(alpha = .72f))
+                "queued" -> Text("◷", fontSize = 10.sp, lineHeight = 11.sp, color = contentColor.copy(alpha = .72f))
                 "read" -> DoubleCheck(Color(0xFF38C878))
                 "delivered" -> DoubleCheck(contentColor.copy(alpha = .78f))
                 else -> Text("✓", fontSize = 10.sp, lineHeight = 11.sp, fontWeight = FontWeight.Medium, color = contentColor.copy(alpha = .72f))

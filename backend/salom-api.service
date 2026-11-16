@@ -14,6 +14,10 @@ StateDirectoryMode=0700
 ExecStart=/opt/salom-api/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 18731 --workers 1 --limit-concurrency 32 --timeout-keep-alive 5 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1
 Restart=on-failure
 RestartSec=3
+# The previous live unit had a 1024 soft limit despite a 524288 hard limit.
+# Set an explicit service soft limit with headroom while SQLite connections
+# are closed promptly by app.connect().
+LimitNOFILE=8192:524288
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

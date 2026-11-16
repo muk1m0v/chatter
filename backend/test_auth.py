@@ -50,7 +50,7 @@ class AuthTests(unittest.TestCase):
     def seed_legacy(self, username='legacy_qa'):
         profile_id, token = str(uuid.uuid4()), secrets.token_urlsafe(32)
         with app.connect() as db:
-            db.execute('INSERT INTO profiles VALUES(?,?,?,?,?,1,?,?)', (profile_id, auth.hash_token(token), 'Legacy QA', username, username or None, time.time(), time.time()))
+            db.execute('INSERT INTO profiles(id,token_hash,name,username,username_key,is_active,created,updated) VALUES(?,?,?,?,?,1,?,?)', (profile_id, auth.hash_token(token), 'Legacy QA', username, username or None, time.time(), time.time()))
         return profile_id, token
 
     def test_only_google_routes_are_available(self):
@@ -89,7 +89,7 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(again['profile']['id'], account['profile']['id'])
         self.assertNotEqual(again['session_token'], account['session_token'])
         self.assertTrue(again['google_linked'])
-        self.assertEqual(set(again['profile']), {'id', 'name', 'username', 'is_active'})
+        self.assertEqual(set(again['profile']), {'id', 'name', 'username', 'is_active', 'avatar_url'})
         self.assertNotIn('email', self.client.get('/search?q=qa', headers=self.headers(account)).text)
 
     def test_username_conflict_is_case_insensitive_and_retryable(self):

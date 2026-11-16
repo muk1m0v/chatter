@@ -42,10 +42,11 @@ def cutoff(db, owner, peer):
     row = db.execute('SELECT through_id FROM conversation_clears WHERE owner_id=? AND peer_id=?', (owner, peer)).fetchone()
     return row[0] if row else 0
 
-def install_routes(app, connect, current_profile):
+def install_routes(app, connect, current_profile, throttle):
     @app.post('/attachments')
     async def upload(request: Request, peer_id: str = Query(min_length=36, max_length=36), name: str = Query(min_length=1, max_length=180), kind: str = Query(default='file', pattern='^(file|voice)$'), duration_ms: int = Query(default=0, ge=0, le=300000), waveform: str = Query(default='', max_length=160), authorization: str | None = Header(default=None)):
         owner = current_profile(authorization)['id']
+        throttle('upload-attachment:' + owner, limit=12)
         try: uuid.UUID(peer_id)
         except ValueError: raise HTTPException(400, 'Неверный получатель')
         if owner == peer_id: raise HTTPException(400, 'Используй Избранное для личных файлов')

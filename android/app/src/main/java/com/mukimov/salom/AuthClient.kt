@@ -42,8 +42,11 @@ internal class AuthClient(private val context: Context, private val directory: D
         val identity = context.getSharedPreferences("salom_directory", Context.MODE_PRIVATE)
         val local = context.getSharedPreferences("salom_local", Context.MODE_PRIVATE)
         val changedAccount = identity.getString("device_id", "") != profile.getString("id")
-        check(identity.edit().putString("device_id", profile.getString("id")).putString("token", result.getString("session_token"))
-            .putString("auth_snapshot", result.toString()).commit()) { "Не удалось сохранить вход" }
+        val snapshot = JSONObject(result.toString()).apply { remove("session_token") }
+        check(identity.edit().putString("device_id", profile.getString("id"))
+            .putString("token_encrypted_v1", SecureTokenStore.encryptedValue(context, result.getString("session_token")))
+            .remove("token")
+            .putString("auth_snapshot", snapshot.toString()).commit()) { "Не удалось сохранить вход" }
         local.edit().apply {
             if (changedAccount) remove("about")
             remove("phone")
