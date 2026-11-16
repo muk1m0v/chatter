@@ -11,6 +11,7 @@ REQUIRED_FILES = (
     "auth.py",
     "database.py",
     "media.py",
+    "monitoring.py",
     "push.py",
     "realtime.py",
     "requirements.txt",

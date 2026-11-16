@@ -22,6 +22,7 @@ from database import INTEGRITY_ERRORS, PostgresConnection, create_pool
 from realtime import RealtimeHub
 from push import PushDispatcher
 from auth import schema as auth_schema, install_routes as install_auth_routes
+from monitoring import RuntimeMetrics, RuntimeReporter
 
 DB = Path(os.environ.get('SALOM_DB', '/var/lib/salom-api/directory.sqlite3'))
 PG_DSN = os.environ.get('SALOM_DATABASE_URL', '').strip()
@@ -144,11 +145,19 @@ async def lifespan(app):
     initialize()
     app.state.realtime = RealtimeHub()
     app.state.event_loop = asyncio.get_running_loop()
-    app.state.push = PushDispatcher(connect)
-    app.state.push.start()
-    yield
-    app.state.push.stop()
-    close_pg_pool()
+    app.state.runtime_metrics = RuntimeMetrics()
+    reporter = RuntimeReporter(app.state.runtime_metrics, lambda: app.state.realtime.connection_count)
+    try:
+        reporter.start()
+        app.state.push = PushDispatcher(connect)
+        app.state.push.start()
+        yield
+    finally:
+        push = getattr(app.state, 'push', None)
+        if push is not None:
+            push.stop()
+        reporter.stop()
+        close_pg_pool()
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -177,12 +186,21 @@ async def validation_error(request, exception):
 
 @app.middleware('http')
 async def bounds(request: Request, call_next):
-    if int(request.headers.get('content-length', '0') or 0) > (media.MAX_FILE if request.url.path == '/attachments' else 65536):
-        return JSONResponse({'detail': 'Слишком большой запрос'}, status_code=413)
-    response = await call_next(request)
-    response.headers['Cache-Control'] = 'no-store'
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    return response
+    started = time.perf_counter()
+    status = 500
+    try:
+        if int(request.headers.get('content-length', '0') or 0) > (media.MAX_FILE if request.url.path == '/attachments' else 65536):
+            response = JSONResponse({'detail': 'Слишком большой запрос'}, status_code=413)
+        else:
+            response = await call_next(request)
+            response.headers['Cache-Control'] = 'no-store'
+            response.headers['X-Content-Type-Options'] = 'nosniff'
+        status = response.status_code
+        return response
+    finally:
+        metrics = getattr(app.state, 'runtime_metrics', None)
+        if metrics is not None:
+            metrics.record_request(request.method, status, (time.perf_counter() - started) * 1000)
 
 def digest(authorization):
     if not authorization or not authorization.startswith('Bearer '):

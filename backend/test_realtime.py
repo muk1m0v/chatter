@@ -43,6 +43,7 @@ class RealtimeHubTests(unittest.IsolatedAsyncioTestCase):
         hub = RealtimeHub()
         user, peer, other = str(uuid4()), str(uuid4()), str(uuid4())
         socket, task = await self.connect(hub, user, peer)
+        self.assertEqual(hub.connection_count, 1)
         await hub.publish(user, {"type": "message", "peer_id": other})
         await asyncio.sleep(0)
         self.assertTrue(socket.sent.empty())
@@ -51,6 +52,7 @@ class RealtimeHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(socket.sent.get(), 1), event)
         await socket.incoming.put(None)
         await asyncio.wait_for(task, 1)
+        self.assertEqual(hub.connection_count, 0)
         self.assertNotIn(user, hub.connections)
 
     async def test_typing_is_forwarded_only_to_active_peer_subscription(self):
@@ -58,6 +60,7 @@ class RealtimeHubTests(unittest.IsolatedAsyncioTestCase):
         alice, bob, carol = str(uuid4()), str(uuid4()), str(uuid4())
         bob_socket, bob_task = await self.connect(hub, bob, alice)
         alice_socket, alice_task = await self.connect(hub, alice, bob)
+        self.assertEqual(hub.connection_count, 2)
         self.assertEqual(await asyncio.wait_for(bob_socket.sent.get(), 1), {"type": "presence", "peer_id": alice, "online": True})
         await alice_socket.incoming.put({"type": "typing", "peer_id": bob, "typing": True})
         self.assertEqual(await asyncio.wait_for(bob_socket.sent.get(), 1), {"type": "typing", "peer_id": alice, "typing": True})
@@ -68,6 +71,7 @@ class RealtimeHubTests(unittest.IsolatedAsyncioTestCase):
         await bob_socket.incoming.put(None)
         await asyncio.wait_for(alice_task, 1)
         await asyncio.wait_for(bob_task, 1)
+        self.assertEqual(hub.connection_count, 0)
 
 
 if __name__ == "__main__":

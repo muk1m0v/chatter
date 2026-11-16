@@ -10,19 +10,25 @@ class RealtimeHub:
         self.per_user_limit = per_user_limit
         self.total_limit = total_limit
         self.connections: dict[str, set[WebSocket]] = {}
+        self._connection_count = 0
         self.subscriptions: dict[WebSocket, str] = {}
         self.typing_last_sent: dict[WebSocket, float] = {}
         self.lock = asyncio.Lock()
 
+    @property
+    def connection_count(self) -> int:
+        return self._connection_count
+
     async def serve(self, socket: WebSocket, profile_id: str) -> None:
         async with self.lock:
             user_connections = self.connections.get(profile_id, set())
-            if len(user_connections) >= self.per_user_limit or sum(map(len, self.connections.values())) >= self.total_limit:
+            if len(user_connections) >= self.per_user_limit or self._connection_count >= self.total_limit:
                 await socket.close(code=1013, reason="Connection limit reached")
                 return
             await socket.accept()
             user_connections = self.connections.setdefault(profile_id, user_connections)
             user_connections.add(socket)
+            self._connection_count += 1
         try:
             await socket.send_json({"type": "ready"})
             while True:
@@ -56,7 +62,10 @@ class RealtimeHub:
             pass
         finally:
             async with self.lock:
+                was_connected = socket in self.connections.get(profile_id, set())
                 self.connections.get(profile_id, set()).discard(socket)
+                if was_connected:
+                    self._connection_count = max(0, self._connection_count - 1)
                 peer_id = self.subscriptions.pop(socket, None)
                 self.typing_last_sent.pop(socket, None)
                 if not self.connections.get(profile_id):
@@ -80,5 +89,8 @@ class RealtimeHub:
         if failed:
             async with self.lock:
                 for socket in failed:
-                    self.connections.get(profile_id, set()).discard(socket)
+                    user_connections = self.connections.get(profile_id, set())
+                    if socket in user_connections:
+                        user_connections.discard(socket)
+                        self._connection_count = max(0, self._connection_count - 1)
                     self.subscriptions.pop(socket, None)
