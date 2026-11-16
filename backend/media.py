@@ -42,6 +42,54 @@ def cutoff(db, owner, peer):
     row = db.execute('SELECT through_id FROM conversation_clears WHERE owner_id=? AND peer_id=?', (owner, peer)).fetchone()
     return row[0] if row else 0
 
+def sniff_mime(prefix: bytes) -> str:
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"): return "image/png"
+    if prefix.startswith(b"\xff\xd8\xff"): return "image/jpeg"
+    if prefix.startswith((b"GIF87a", b"GIF89a")): return "image/gif"
+    if len(prefix) >= 12 and prefix[:4] == b"RIFF" and prefix[8:12] == b"WEBP": return "image/webp"
+    if prefix.startswith(b"BM"): return "image/bmp"
+    if prefix.startswith(b"%PDF-"): return "application/pdf"
+    if prefix.startswith(b"PK\x03\x04"): return "application/zip"
+    if len(prefix) >= 12 and prefix[4:8] == b"ftyp":
+        brand = prefix[8:12].lower()
+        return "audio/mp4" if brand in (b"m4a ", b"m4b ", b"m4p ", b"f4a ") else "video/mp4"
+    if prefix.startswith(b"\x1aE\xdf\xa3"): return "video/webm"
+    if prefix.startswith((b"ID3", b"OggS", b"fLaC", b"RIFF")):
+        if prefix.startswith(b"OggS"): return "audio/ogg"
+        if prefix.startswith(b"fLaC"): return "audio/flac"
+        if prefix.startswith(b"RIFF") and prefix[8:12] == b"WAVE": return "audio/wav"
+        if prefix.startswith(b"ID3"): return "audio/mpeg"
+    if len(prefix) >= 2 and prefix[0] == 0xFF and (prefix[1] & 0xF6) == 0xF0: return "audio/aac"
+    if prefix and b"\x00" not in prefix:
+        try:
+            prefix.decode("utf-8-sig")
+            return "text/plain"
+        except UnicodeDecodeError:
+            pass
+    return "application/octet-stream"
+
+def verified_mime(declared: str, prefix: bytes, filename: str) -> str:
+    actual = sniff_mime(prefix)
+    declared = {"image/jpg": "image/jpeg", "audio/x-m4a": "audio/mp4"}.get(declared, declared)
+    text_types = {"application/json", "application/xml", "application/javascript", "application/x-yaml", "application/yaml", "application/csv"}
+    office_ext = Path(filename).suffix.lower()
+    office_zip = {
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
+    if actual == "application/zip" and office_zip.get(office_ext) == declared:
+        return declared
+    if actual == "text/plain" and (declared.startswith("text/") or declared in text_types):
+        return declared
+    if declared in ("application/octet-stream", "binary/octet-stream"):
+        return actual
+    if actual == "application/octet-stream":
+        raise HTTPException(400, "Содержимое файла не соответствует его типу")
+    if declared != actual:
+        raise HTTPException(400, "Содержимое файла не соответствует его типу")
+    return actual
+
 def install_routes(app, connect, current_profile, throttle):
     @app.post('/attachments')
     async def upload(request: Request, peer_id: str = Query(min_length=36, max_length=36), name: str = Query(min_length=1, max_length=180), kind: str = Query(default='file', pattern='^(file|voice)$'), duration_ms: int = Query(default=0, ge=0, le=300000), waveform: str = Query(default='', max_length=160), authorization: str | None = Header(default=None)):
@@ -78,6 +126,7 @@ def install_routes(app, connect, current_profile, throttle):
             db.execute('INSERT INTO attachments(id,owner_id,peer_id,name,mime,size,created,ready,kind,duration_ms,waveform) VALUES(?,?,?,?,?,?,?,0,?,?,?)', (attachment_id, owner, peer_id, filename, mime, reserved, time.time(), kind, duration_ms, json.dumps(peaks)))
         path = ROOT / attachment_id
         complete = False
+        first_chunk = bytearray()
         try:
             total = 0
             with path.open('xb') as output:
@@ -85,10 +134,13 @@ def install_routes(app, connect, current_profile, throttle):
                 async for chunk in request.stream():
                     total += len(chunk)
                     if total > reserved or total > MAX_FILE: raise HTTPException(413, 'Максимальный размер файла — 25 МБ')
+                    if len(first_chunk) < 4096:
+                        first_chunk.extend(chunk[:4096 - len(first_chunk)])
                     output.write(chunk)
             if total == 0: raise HTTPException(400, 'Файл пустой')
+            mime = verified_mime(mime, bytes(first_chunk), filename)
             with connect() as db:
-                db.execute('UPDATE attachments SET size=?,ready=1 WHERE id=?', (total, attachment_id))
+                db.execute('UPDATE attachments SET size=?,mime=?,ready=1 WHERE id=?', (total, mime, attachment_id))
                 result = metadata(db, attachment_id)
             complete = True
             return result

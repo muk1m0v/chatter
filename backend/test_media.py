@@ -94,6 +94,16 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(downloaded.headers['x-content-type-options'],'nosniff')
         self.assertIn('attachment;',downloaded.headers['content-disposition'])
 
+    def test_declared_image_type_must_match_file_signature(self):
+        response=self.upload(b'not a PNG image',name='photo.png',mime='image/png')
+        self.assertEqual(response.status_code,400)
+        with app.connect() as db: self.assertEqual(db.execute('SELECT COUNT(*) FROM attachments').fetchone()[0],0)
+
+    def test_octet_stream_is_stored_with_sniffed_pdf_mime(self):
+        response=self.upload(b'%PDF-1.7\nsynthetic test',name='sample.bin',mime='application/octet-stream')
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(response.json()['mime'],'application/pdf')
+
     def test_stale_unused_upload_is_cleaned_but_sent_file_survives(self):
         stale=self.upload().json(); sent=self.upload().json(); self.send(sent)
         with app.connect() as db: db.execute('UPDATE attachments SET created=?',(time.time()-90000,))
@@ -109,7 +119,8 @@ class MediaTests(unittest.TestCase):
 
     def test_voice_metadata_round_trip_and_private_access(self):
         params={'peer_id':self.ids[1], 'name':'voice_qa.m4a', 'kind':'voice', 'duration_ms':1234, 'waveform':'0,12,100,3'}
-        result=self.client.post('/attachments',params=params,headers={**self.headers(),'Content-Type':'audio/mp4'},content=b'Voice transport QA')
+        voice_bytes=b'\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00'
+        result=self.client.post('/attachments',params=params,headers={**self.headers(),'Content-Type':'audio/mp4'},content=voice_bytes)
         self.assertEqual(result.status_code,200,result.text)
         attachment=result.json()
         self.assertEqual((attachment['kind'],attachment['duration_ms'],attachment['waveform']),('voice',1234,[0,12,100,3]))
@@ -117,7 +128,7 @@ class MediaTests(unittest.TestCase):
         received=self.history(1,0)['messages'][0]['attachment']
         self.assertEqual(received,attachment)
         self.assertEqual(self.client.get('/conversations',headers=self.headers(1)).json()['conversations'][0]['last_text'],'Голосовое сообщение')
-        self.assertEqual(self.download(attachment,1).content,b'Voice transport QA')
+        self.assertEqual(self.download(attachment,1).content,voice_bytes)
         self.assertEqual(self.download(attachment,2).status_code,404)
 
     def test_invalid_voice_metadata_is_rejected(self):
