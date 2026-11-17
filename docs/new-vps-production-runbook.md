@@ -24,6 +24,8 @@ No server configuration was changed during this baseline check.
 - Root/password SSH login is disabled. Public-key login to `salom-deploy` was verified after the change. Its account is locked and has no usable sudo rights, so privileged deployment work is paused pending recovery of controlled admin access through the DigitalOcean console. Do not re-enable password SSH; restore root public-key-only access or install the intended narrow sudoers wrapper from the console.
 - Current measured footprint after package installation: 961 MiB RAM total, about 582 MiB available, 2 GiB swap with under 1 MiB used, and 19 GiB free on the 24 GiB root disk. These are idle-host readings, not load capacity.
 - A read-only GitHub deploy key was generated under `/home/salom-deploy/.ssh`; its public half must be added as a read-only deploy key in the private repository before cloning. Its private half is not in Git.
+- Server-only source from commit `edcc61b2e77fb8341eda1e3ec9429b250b252ddb` is staged at `/home/salom-deploy/stage/edcc61b2e77fb8341eda1e3ec9429b250b252ddb` (backend, ops, and this runbook; 49 files, 352 KiB). The staged tree has no `.env`, key, credential, secret-named file, or `google-services.json`; it is not installed or running.
+- Read-only checks still show the old production API active and `mukimov.site` resolving to `94.237.62.77`. The old VPS has about 451 GiB free; no data, DNS, or service settings were changed there during this turn.
 - No SALOM release, user data, Firebase credential, production database, backup destination, TLS certificate, or DNS change has been installed/configured on the new host.
 
 ## Architecture decisions
