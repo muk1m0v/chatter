@@ -1,0 +1,24 @@
+[Unit]
+Description=SALOM host health snapshot
+After=salom-api.service nginx.service postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /opt/salom-api/current/ops/salom-healthcheck.py
+StateDirectory=salom-monitor
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ReadWritePaths=/var/lib/salom-monitor
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+

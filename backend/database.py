@@ -1,4 +1,5 @@
 """Small psycopg adapter preserving the current synchronous SQLite call surface."""
+import os
 import re
 import sqlite3
 from typing import Any
@@ -76,6 +77,12 @@ class PostgresConnection:
 
 
 def create_pool(dsn: str) -> ConnectionPool:
-    pool = ConnectionPool(dsn, min_size=1, max_size=8, timeout=5, max_waiting=32, open=False, name="salom-api")
+    try:
+        max_size = int(os.environ.get("SALOM_DB_POOL_SIZE", "4"))
+    except ValueError as error:
+        raise ValueError("SALOM_DB_POOL_SIZE must be an integer from 1 to 8") from error
+    if not 1 <= max_size <= 8:
+        raise ValueError("SALOM_DB_POOL_SIZE must be from 1 to 8")
+    pool = ConnectionPool(dsn, min_size=1, max_size=max_size, timeout=5, max_waiting=16, open=False, name="salom-api")
     pool.open(wait=True, timeout=10)
     return pool

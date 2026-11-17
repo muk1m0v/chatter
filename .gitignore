@@ -42,6 +42,9 @@ captures/
 *.sqlite3-*
 *.db
 *.dump
+*.backup
+*.tar
+*.tar.gz
 .DS_Store
 Thumbs.db
 # Environment files and local-only credentials

@@ -78,11 +78,14 @@ def close_pg_pool():
             pg_pool = None
 
 def initialize():
+    if os.environ.get('SALOM_REQUIRE_POSTGRES') == '1' and not PG_DSN:
+        raise RuntimeError('SALOM_DATABASE_URL is required on this server')
     if PG_DSN:
         required = {
             'profiles': 'id,token_hash,name,username,username_key,is_active,created,updated,online_at,typing_to,typing_at,avatar_url',
             'accounts': 'profile_id,firebase_uid,phone,email,password_hash,created,password_changed,google_linked',
             'sessions': 'token_hash,profile_id,created,expires,verified_at',
+            'email_challenges': 'id,email,code_hash,expires,created,attempts,ready,verified,ticket_hash,used',
             'attachments': 'id,owner_id,peer_id,name,mime,size,created,ready,kind,duration_ms,waveform',
             'messages': 'id,sender_id,recipient_id,client_id,text,created,delivered_at,read_at,reply_to_id,edited_at,location_id,attachment_id',
             'message_events': 'id,message_id,sender_id,recipient_id,owner_id,kind',
@@ -138,6 +141,13 @@ def initialize():
         if 'edited_at' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN edited_at REAL')
         if 'location_id' not in message_columns: db.execute('ALTER TABLE messages ADD COLUMN location_id TEXT')
         auth_schema(db)
+        # Preserve the legacy email-verification table during SQLite/PostgreSQL migration.
+        db.executescript('''CREATE TABLE IF NOT EXISTS email_challenges (
+          id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL,
+          expires REAL NOT NULL, created REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          ready INTEGER NOT NULL DEFAULT 0, verified REAL, ticket_hash TEXT, used REAL);
+          CREATE INDEX IF NOT EXISTS email_challenges_email ON email_challenges(email,created);
+        ''')
         media.schema(db)
 
 @asynccontextmanager

@@ -11,12 +11,14 @@ REQUIRED_FILES = (
     "auth.py",
     "database.py",
     "media.py",
+    "migrate_sqlite_to_postgres.py",
+    "migrate_sqlite_to_postgres_prod.py",
     "monitoring.py",
     "push.py",
     "realtime.py",
     "requirements.txt",
+    "requirements.lock",
     "salom-api.service",
-    "migrate_sqlite_to_postgres.py",
 )
 
 

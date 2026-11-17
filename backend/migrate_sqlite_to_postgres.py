@@ -25,6 +25,8 @@ TABLES = {
     "live_locations": ("id", "owner_id", "peer_id", "created", "expires", "latitude", "longitude", "updated", "active"),
     "accounts": ("profile_id", "firebase_uid", "phone", "email", "password_hash", "created", "password_changed", "google_linked"),
     "sessions": ("token_hash", "profile_id", "created", "expires", "verified_at"),
+    # Retain the now-unused legacy table from the live SQLite database for a faithful migration.
+    "email_challenges": ("id", "email", "code_hash", "expires", "created", "attempts", "ready", "verified", "ticket_hash", "used"),
     "auth_limits": ("key", "at"),
     "push_tokens": ("profile_id", "token", "updated"),
     "push_jobs": ("message_id", "state", "attempts", "next_at", "last_error"),
@@ -33,7 +35,7 @@ ORDER_COLUMNS = {
     "profiles": ("id",), "registrations": ("ip", "at"), "attachments": ("id",),
     "conversation_clears": ("owner_id", "peer_id"), "messages": ("id",),
     "message_events": ("id",), "message_hides": ("owner_id", "message_id"),
-    "live_locations": ("id",), "accounts": ("profile_id",), "sessions": ("token_hash",),
+    "live_locations": ("id",), "accounts": ("profile_id",), "sessions": ("token_hash",), "email_challenges": ("id",),
     "auth_limits": ("key", "at"), "push_tokens": ("profile_id",), "push_jobs": ("message_id",),
 }
 
@@ -91,6 +93,12 @@ CREATE TABLE sessions (
   created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL,
   verified_at DOUBLE PRECISION NOT NULL
 );
+CREATE TABLE email_challenges (
+  id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL,
+  expires DOUBLE PRECISION NOT NULL, created DOUBLE PRECISION NOT NULL,
+  attempts BIGINT NOT NULL DEFAULT 0, ready SMALLINT NOT NULL DEFAULT 0,
+  verified DOUBLE PRECISION, ticket_hash TEXT, used DOUBLE PRECISION
+);
 CREATE TABLE auth_limits (key TEXT NOT NULL, at DOUBLE PRECISION NOT NULL);
 CREATE TABLE push_tokens (
   profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
@@ -107,6 +115,7 @@ CREATE INDEX messages_pair ON messages(sender_id,recipient_id,id);
 CREATE INDEX messages_recipient ON messages(recipient_id,id);
 CREATE INDEX message_events_pair ON message_events(sender_id,recipient_id,id);
 CREATE INDEX sessions_profile ON sessions(profile_id);
+CREATE INDEX email_challenges_email ON email_challenges(email,created);
 CREATE INDEX auth_limits_key ON auth_limits(key,at);
 CREATE INDEX push_jobs_pending ON push_jobs(state,next_at);
 """
@@ -135,11 +144,16 @@ def validate_source(path: Path):
     if integrity != "ok":
         db.close()
         raise ValueError(f"SQLite integrity check failed: {integrity}")
+    found_tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    expected_tables = set(TABLES)
+    if found_tables != expected_tables:
+        db.close()
+        raise ValueError("Unexpected SQLite table set; refusing to omit or invent user data")
     for table, columns in TABLES.items():
         found = tuple(row[1] for row in db.execute(f"PRAGMA table_info({table})"))
-        if found != columns:
+        if set(found) != set(columns):
             db.close()
-            raise ValueError(f"Unexpected SQLite schema for {table}; initialize a copy with the current backend first")
+            raise ValueError(f"Unexpected SQLite columns for {table}; refusing to omit or invent fields")
     return db
 
 
