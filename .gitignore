@@ -37,10 +37,31 @@ captures/
 *.tmp
 *.swp
 *.hprof
+*.sqlite
 *.sqlite3
 *.sqlite3-*
+*.db
+*.dump
 .DS_Store
 Thumbs.db
+# Environment files and local-only credentials
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+.ssh/
+id_rsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+# Local backups and database exports
+backups/
+*.sql.gz
 # Server-only Firebase credentials never belong in the APK or repository.
 *firebase-adminsdk*.json
 firebase-admin.json
