@@ -1,5 +1,5 @@
 """Run on the authorized VPS after uploading index.html and release files to /tmp/salom-deploy.
-Preserves the existing proxy routes and makes backups before nginx changes.
+Preserves existing proxy routes and backs up the current site/config before publishing.
 """
 from pathlib import Path
 import datetime
