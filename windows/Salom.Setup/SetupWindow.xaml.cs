@@ -19,8 +19,10 @@ public partial class SetupWindow : Window
         try
         {
             await Task.Run(InstallFiles);
-            CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Салом"), "Салом.lnk");
-            CreateShortcut(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Салом.lnk");
+            // Keep shortcut paths ASCII: WScript.Shell can otherwise use the
+            // system ANSI code page and replace Cyrillic characters with '?'.
+            CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "SALOM"), "SALOM.lnk");
+            CreateShortcut(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "SALOM.lnk");
             var exe = Path.Combine(_installPath, "Salom.Desktop.exe");
             Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true });
             MessageBox.Show(this, "Салом установлен.\n\nДля входа в Windows-версии нужны Desktop OAuth и Firebase Web API настройки.", "Готово", MessageBoxButton.OK, MessageBoxImage.Information);

@@ -1,4 +1,4 @@
-"""Run on the authorized VPS after uploading index.html and the APK to /tmp/salom-deploy.
+"""Run on the authorized VPS after uploading index.html and release files to /tmp/salom-deploy.
 Preserves the existing proxy routes and makes backups before nginx changes.
 """
 from pathlib import Path
@@ -23,10 +23,21 @@ assert isinstance(min_sdk, int) and 24 <= min_sdk <= 100
 assert isinstance(release_notes, list) and len(release_notes) <= 5 and all(isinstance(note, str) and len(note) <= 240 for note in release_notes)
 apk = incoming / f'salom-{version}.apk'
 assert apk.is_file() and apk.stat().st_size > 100_000
+windows_file = release_input.get('windowsFile')
+windows_size = None
+windows_sha256 = None
+if windows_file:
+    assert isinstance(windows_file, str) and re.fullmatch(r'SALOM-[0-9.]+-AllowCookie-Setup\.exe', windows_file)
+    windows_installer = incoming / windows_file
+    assert windows_installer.is_file() and windows_installer.stat().st_size > 1_000_000
+    windows_size = windows_installer.stat().st_size
+    windows_sha256 = hashlib.sha256(windows_installer.read_bytes()).hexdigest()
 assert (incoming / 'index.html').is_file()
-config = Path('/etc/nginx/sites-available/ryadom')
-page = Path('/var/www/mukimov-test/index.html')
+config = Path('/etc/nginx/sites-available/salom-site.conf')
+page = Path('/var/www/salom-site/index.html')
 assert 'server_name mukimov.site;' in config.read_text()
+assert 'alias /var/www/salom/;' in config.read_text(), 'Nginx must already serve /salom/ from /var/www/salom/'
+assert 'alias /var/www/salom/version.json;' in config.read_text(), 'Nginx must already serve /salom/version.json'
 backup = Path('/var/backups') / ('salom-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
 backup.mkdir(parents=True, exist_ok=False)
 shutil.copy2(config, backup / 'nginx.conf')
@@ -35,6 +46,8 @@ target = Path('/var/www/salom')
 target.mkdir(parents=True, exist_ok=True)
 for filename in ('salom-latest.apk', 'version.json'):
     if (target / filename).exists(): shutil.copy2(target / filename, backup / filename)
+if windows_file and (target / windows_file).exists():
+    shutil.copy2(target / windows_file, backup / windows_file)
 sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
 old_metadata_path = target / 'version.json'
 if old_metadata_path.is_file():
@@ -50,40 +63,20 @@ for filename in (apk.name, 'salom-latest.apk'):
     shutil.copy2(apk, temporary)
     temporary.chmod(0o644)
     temporary.replace(target / filename)
+if windows_file:
+    if (target / windows_file).exists():
+        assert hashlib.sha256((target / windows_file).read_bytes()).hexdigest() == windows_sha256, 'A published Windows installer must never change bytes'
+    temporary = target / (windows_file + '.tmp')
+    shutil.copy2(windows_installer, temporary)
+    temporary.chmod(0o644)
+    temporary.replace(target / windows_file)
 metadata = {'version': version, 'displayName': display_name, 'versionCode': version_code, 'minSdk': min_sdk, 'downloadUrl': 'https://mukimov.site/salom/' + apk.name, 'size': apk.stat().st_size, 'sha256': sha256,
             'releaseNotes': release_notes}
+if windows_file:
+    metadata.update({'windowsFile': windows_file, 'windowsSize': windows_size, 'windowsSha256': windows_sha256})
 for file in target.iterdir():
     if file.is_file(): file.chmod(0o644)
-new_config = config.read_text()
-marker = '    # Salom downloads\n'
-anchor = '    location /static/ {'
-if marker in new_config:
-    start = new_config.index(marker)
-    end = new_config.index(anchor, start)
-    new_config = new_config[:start] + new_config[end:]
-if marker not in new_config:
-    routes = marker
-    for filename in sorted(file.name for file in target.glob('salom-*.apk')):
-        download_name = apk.name if filename == 'salom-latest.apk' else filename
-        routes += f'''    location = /salom/{filename} {{
-        alias /var/www/salom/{filename};
-        default_type application/vnd.android.package-archive;
-        add_header Content-Disposition 'attachment; filename="{download_name}"';
-        add_header Cache-Control 'no-store';
-        add_header X-Content-Type-Options nosniff always;
-    }}
-'''
-    routes += '''    location = /salom/version.json {
-        alias /var/www/salom/version.json;
-        default_type application/json;
-        add_header Cache-Control 'no-store';
-    }
-'''
-    anchor = '    location /static/ {'
-    assert anchor in new_config
-    new_config = new_config.replace(anchor, routes + anchor, 1)
 try:
-    config.write_text(new_config)
     subprocess.run(['nginx', '-t'], check=True)
     shutil.copy2(incoming / 'index.html', page)
     page.chmod(0o644)
@@ -94,11 +87,9 @@ try:
     temporary.chmod(0o644)
     temporary.replace(target / 'version.json')
 except Exception:
-    shutil.copy2(backup / 'nginx.conf', config)
     shutil.copy2(backup / 'index.html', page)
     for filename in ('salom-latest.apk', 'version.json'):
         if (backup / filename).exists(): shutil.copy2(backup / filename, target / filename)
-    subprocess.run(['nginx', '-t'], check=True)
-    subprocess.run(['systemctl', 'reload', 'nginx'], check=True)
+    if windows_file and (backup / windows_file).exists(): shutil.copy2(backup / windows_file, target / windows_file)
     raise
 print(json.dumps({'backup': str(backup), 'sha256': metadata['sha256'], 'size': metadata['size']}))

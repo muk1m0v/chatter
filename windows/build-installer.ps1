@@ -11,6 +11,7 @@ dotnet publish $appProject -c Release -r win-x64 --self-contained true --no-rest
 if ($LASTEXITCODE -ne 0) { throw 'Desktop application publish failed.' }
 if (Test-Path -LiteralPath $payload) { Remove-Item -LiteralPath $payload -Force }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression
 $archive = [IO.Compression.ZipFile]::Open($payload,[IO.Compression.ZipArchiveMode]::Create)
 try {
     Get-ChildItem -LiteralPath $appPublish -File -Recurse | Where-Object { $_.Extension -notin '.pdb','.xml' } | ForEach-Object {
