@@ -37,22 +37,31 @@ class RealtimeHub:
                 if kind == "ping":
                     await socket.send_json({"type": "pong"})
                 elif kind == "subscribe":
+                    raw_peer_id = message.get("peer_id", "")
+                    if raw_peer_id == "*":
+                        peer_id = "*"
+                    else:
+                        try:
+                            peer_id = str(UUID(raw_peer_id))
+                        except (ValueError, TypeError, AttributeError):
+                            await socket.close(code=1008, reason="Invalid peer")
+                            return
+                    async with self.lock:
+                        self.subscriptions[socket] = peer_id
+                        peer_online = bool(self.connections.get(peer_id)) if peer_id != "*" else False
+                    await socket.send_json({"type": "subscribed", "peer_id": peer_id})
+                    if peer_id != "*":
+                        await socket.send_json({"type": "presence", "peer_id": peer_id, "online": peer_online})
+                        await self.publish(peer_id, {"type": "presence", "peer_id": profile_id, "online": True})
+                elif kind == "typing":
+                    subscribed_peer = self.subscriptions.get(socket)
                     try:
                         peer_id = str(UUID(message.get("peer_id", "")))
                     except (ValueError, TypeError, AttributeError):
-                        await socket.close(code=1008, reason="Invalid peer")
-                        return
-                    async with self.lock:
-                        self.subscriptions[socket] = peer_id
-                        peer_online = bool(self.connections.get(peer_id))
-                    await socket.send_json({"type": "subscribed", "peer_id": peer_id})
-                    await socket.send_json({"type": "presence", "peer_id": peer_id, "online": peer_online})
-                    await self.publish(peer_id, {"type": "presence", "peer_id": profile_id, "online": True})
-                elif kind == "typing":
-                    peer_id = self.subscriptions.get(socket)
+                        continue
                     now = asyncio.get_running_loop().time()
                     previous = self.typing_last_sent.get(socket, 0.0)
-                    if peer_id and message.get("peer_id") == peer_id and isinstance(message.get("typing"), bool) and now - previous >= 0.35:
+                    if subscribed_peer in (peer_id, "*") and isinstance(message.get("typing"), bool) and now - previous >= 0.35:
                         self.typing_last_sent[socket] = now
                         await self.publish(peer_id, {"type": "typing", "peer_id": profile_id, "typing": message["typing"]})
         except WebSocketDisconnect:
@@ -73,13 +82,13 @@ class RealtimeHub:
                     became_offline = True
                 else:
                     became_offline = False
-            if became_offline and peer_id:
+            if became_offline and peer_id and peer_id != "*":
                 await self.publish(peer_id, {"type": "presence", "peer_id": profile_id, "online": False})
 
     async def publish(self, profile_id: str, event: dict) -> None:
         async with self.lock:
             targets = [socket for socket in self.connections.get(profile_id, set())
-                       if not event.get("peer_id") or self.subscriptions.get(socket) == event.get("peer_id")]
+                       if not event.get("peer_id") or self.subscriptions.get(socket) in (event.get("peer_id"), "*")]
         failed = []
         for socket in targets:
             try:

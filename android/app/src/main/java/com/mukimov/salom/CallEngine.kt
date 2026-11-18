@@ -5,10 +5,19 @@ import android.media.AudioManager
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
+import org.webrtc.Camera2Enumerator
+import org.webrtc.DefaultVideoDecoderFactory
+import org.webrtc.DefaultVideoEncoderFactory
+import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.SurfaceTextureHelper
+import org.webrtc.SurfaceViewRenderer
+import org.webrtc.VideoCapturer
+import org.webrtc.VideoSource
+import org.webrtc.VideoTrack
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -31,6 +40,13 @@ internal class CallEngine(
     private val previousSpeaker = audioManager.isSpeakerphoneOn
     private var source: AudioSource? = null
     private var track: AudioTrack? = null
+    private var camera: VideoCapturer? = null
+    private var textureHelper: SurfaceTextureHelper? = null
+    private var videoSource: VideoSource? = null
+    private var videoTrack: VideoTrack? = null
+    private var remoteVideo: VideoTrack? = null
+    private var localRenderer: SurfaceViewRenderer? = null
+    private var remoteRenderer: SurfaceViewRenderer? = null
     private var peer: PeerConnection? = null
     private val pendingIce = ConcurrentLinkedQueue<IceCandidate>()
     @Volatile private var remoteDescriptionReady = false
@@ -83,11 +99,29 @@ internal class CallEngine(
             }
             override fun onTrack(transceiver: org.webrtc.RtpTransceiver) {
                 (transceiver.receiver.track() as? AudioTrack)?.setEnabled(true)
+                (transceiver.receiver.track() as? VideoTrack)?.let { video ->
+                    remoteVideo = video; video.setEnabled(true); remoteRenderer?.let(video::addSink)
+                }
             }
         }) ?: error("Не удалось создать аудиозвонок")
         source = factory.createAudioSource(MediaConstraints())
         track = factory.createAudioTrack("salom-audio", source).also { it.setEnabled(true) }
         peer?.addTrack(track, listOf("salom-call"))
+        if (androidx.core.content.ContextCompat.checkSelfPermission(app, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            runCatching {
+                val enumerator = Camera2Enumerator(app)
+                val cameraName = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) } ?: enumerator.deviceNames.firstOrNull()
+                    ?: error("Камера не найдена")
+                camera = enumerator.createCapturer(cameraName, null) ?: error("Не удалось открыть камеру")
+                videoSource = factory.createVideoSource(false)
+                textureHelper = SurfaceTextureHelper.create("SalomCamera", CallWebRtc.egl.eglBaseContext)
+                camera!!.initialize(textureHelper, app, videoSource!!.capturerObserver)
+                camera!!.startCapture(640, 480, 24)
+                videoTrack = factory.createVideoTrack("salom-video", videoSource).also { it.setEnabled(true) }
+                peer?.addTrack(videoTrack, listOf("salom-call"))
+                localRenderer?.let { videoTrack?.addSink(it) }
+            }.onFailure { onState("video_unavailable") }
+        }
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         audioManager.isSpeakerphoneOn = false
         CallForegroundService.start(app, callId, peerId, peerName)
@@ -153,12 +187,18 @@ internal class CallEngine(
 
     fun setMuted(muted: Boolean) { track?.setEnabled(!muted) }
     fun setSpeaker(enabled: Boolean) { audioManager.isSpeakerphoneOn = enabled }
+    fun setVideoEnabled(enabled: Boolean) { videoTrack?.setEnabled(enabled) }
+    fun attachRenderers(local: SurfaceViewRenderer?, remote: SurfaceViewRenderer?) {
+        localRenderer?.let { videoTrack?.removeSink(it) }; remoteRenderer?.let { remoteVideo?.removeSink(it) }
+        localRenderer = local; remoteRenderer = remote
+        local?.let { videoTrack?.addSink(it) }; remote?.let { remoteVideo?.addSink(it) }
+    }
 
     fun close() {
         if (closed) return
         closed = true
-        runCatching { track?.setEnabled(false); track?.dispose(); source?.dispose(); peer?.close(); peer?.dispose() }
-        track = null; source = null; peer = null
+        runCatching { camera?.stopCapture(); camera?.dispose(); textureHelper?.dispose(); videoTrack?.setEnabled(false); videoTrack?.dispose(); videoSource?.dispose(); track?.setEnabled(false); track?.dispose(); source?.dispose(); peer?.close(); peer?.dispose() }
+        camera = null; textureHelper = null; videoTrack = null; videoSource = null; track = null; source = null; peer = null
         audioManager.mode = previousMode
         audioManager.isSpeakerphoneOn = previousSpeaker
         CallForegroundService.stop(app)
@@ -172,12 +212,15 @@ private open class SdpObserverAdapter : SdpObserver {
     override fun onSetFailure(error: String) = Unit
 }
 
-private object CallWebRtc {
+internal object CallWebRtc {
     @Volatile private var instance: PeerConnectionFactory? = null
+    val egl: EglBase by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { EglBase.create() }
     fun factory(context: Context): PeerConnectionFactory = instance ?: synchronized(this) {
         instance ?: run {
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions())
-            PeerConnectionFactory.builder().createPeerConnectionFactory().also { instance = it }
+            PeerConnectionFactory.builder().setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
+                .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext)).createPeerConnectionFactory().also { instance = it }
         }
     }
+    fun initRenderer(renderer: SurfaceViewRenderer, mirror: Boolean) { renderer.init(egl.eglBaseContext, null); renderer.setEnableHardwareScaler(true); renderer.setMirror(mirror) }
 }

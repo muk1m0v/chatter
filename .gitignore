@@ -20,10 +20,15 @@ dist/
 # Android / Gradle generated and machine-specific files
 .gradle/
 .gradle-home/
+.gradle-user/
 .nuget-packages/
 .salom-package-stage/
 android/.android-home/
 windows/**/bin/
+windows/**/artifacts/
+windows/Salom.Setup/payload/
+outputs/*.apk
+outputs/*.exe
 windows/**/obj/
 .kotlin/
 build/

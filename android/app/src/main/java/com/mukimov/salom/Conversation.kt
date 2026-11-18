@@ -28,6 +28,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.paint
 import androidx.compose.ui.graphics.graphicsLayer
@@ -129,9 +130,11 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var pendingCallSignals by remember(person.id) { mutableStateOf<List<Pair<String, org.json.JSONObject>>>(emptyList()) }
     var callMuted by remember { mutableStateOf(false) }
     var callSpeaker by remember { mutableStateOf(false) }
+    var callVideoEnabled by remember { mutableStateOf(true) }
     var callError by remember { mutableStateOf<String?>(null) }
     var pendingOutgoing by remember { mutableStateOf(false) }
-    val callMicPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    val callMicPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        val granted = grants[Manifest.permission.RECORD_AUDIO] == true || androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val call = activeCall
         if (granted && call == null && pendingOutgoing) {
             pendingOutgoing = false
@@ -164,12 +167,12 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             }
         } else if (!granted) { pendingOutgoing = false; callError = "Для звонка нужно разрешить доступ к микрофону"; sendError = callError }
     }
-    fun requestCallMicrophone() = callMicPermission.launch(Manifest.permission.RECORD_AUDIO)
+    fun requestCallMicrophone() = callMicPermission.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
     fun startOutgoingCall() {
         if (saved || activeCall != null) return
-        if (androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED || androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             pendingOutgoing = true
-            callMicPermission.launch(Manifest.permission.RECORD_AUDIO)
+            callMicPermission.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
             return
         }
         scope.launch {
@@ -769,6 +772,12 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     activeCall?.let { call ->
         Dialog(onDismissRequest = { }) {
             var callSeconds by remember(call.callId) { mutableIntStateOf(0) }
+            var localCallRenderer by remember(call.callId) { mutableStateOf<org.webrtc.SurfaceViewRenderer?>(null) }
+            var remoteCallRenderer by remember(call.callId) { mutableStateOf<org.webrtc.SurfaceViewRenderer?>(null) }
+            DisposableEffect(call.callId, callEngine, localCallRenderer, remoteCallRenderer) {
+                callEngine?.attachRenderers(localCallRenderer, remoteCallRenderer)
+                onDispose { callEngine?.attachRenderers(null, null) }
+            }
             LaunchedEffect(call.callId, call.state) {
                 if (call.state == "connected") while (isActive) { delay(1_000); callSeconds++ }
             }
@@ -776,6 +785,10 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 Column(Modifier.padding(horizontal = 24.dp, vertical = 34.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     Box(Modifier.size(82.dp).clip(CircleShape).background(Yellow), contentAlignment = Alignment.Center) {
                         Text(call.peerName.take(1).uppercase(), fontSize = 34.sp, fontWeight = FontWeight.Bold, color = Ink)
+                    }
+                    if (callEngine != null && call.state != "incoming") Box(Modifier.fillMaxWidth().height(210.dp).clip(RoundedCornerShape(18.dp)).background(Color.Black)) {
+                        AndroidView(factory = { viewContext -> org.webrtc.SurfaceViewRenderer(viewContext).also { CallWebRtc.initRenderer(it, false); remoteCallRenderer = it } }, modifier = Modifier.fillMaxSize(), onRelease = { it.release(); if (remoteCallRenderer === it) remoteCallRenderer = null })
+                        AndroidView(factory = { viewContext -> org.webrtc.SurfaceViewRenderer(viewContext).also { CallWebRtc.initRenderer(it, true); localCallRenderer = it } }, modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).width(92.dp).height(128.dp).clip(RoundedCornerShape(12.dp)), onRelease = { it.release(); if (localCallRenderer === it) localCallRenderer = null })
                     }
                     Text(call.peerName, fontSize = 23.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(callError ?: when (call.state) {
@@ -797,6 +810,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
                             FilledTonalButton(onClick = { callMuted = !callMuted; callEngine?.setMuted(callMuted) }) { Text(if (callMuted) "Включить микрофон" else "Без звука") }
                             FilledTonalButton(onClick = { callSpeaker = !callSpeaker; callEngine?.setSpeaker(callSpeaker) }) { Text(if (callSpeaker) "Динамик выкл." else "Динамик") }
+                            FilledTonalButton(onClick = { callVideoEnabled = !callVideoEnabled; callEngine?.setVideoEnabled(callVideoEnabled) }) { Text(if (callVideoEnabled) "Камера выкл." else "Камера") }
                         }
                         Button(onClick = { endCall(if (call.state == "ringing") "cancel" else "end") }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
                             Text("Завершить звонок")
