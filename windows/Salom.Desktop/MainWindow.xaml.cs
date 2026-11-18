@@ -1,7 +1,11 @@
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Threading;
+using System.Net.WebSockets;
+using System.Text.Json;
+using Microsoft.Win32;
 using Microsoft.VisualBasic;
 
 namespace Salom.Desktop;
@@ -12,10 +16,11 @@ public partial class MainWindow : Window
     private readonly LocalChatStore _store = new();
     private readonly ObservableCollection<ChatItem> _chats = new();
     private readonly ObservableCollection<ChatMessage> _messages = new();
-    private readonly DispatcherTimer _syncTimer = new() { Interval = TimeSpan.FromSeconds(7) };
     private ChatItem? _activeChat;
     private bool _syncInProgress;
     private bool _searchPlaceholder = true;
+    private bool _peerOnline;
+    private CancellationTokenSource? _realtimeCancellation;
 
     public MainWindow()
     {
@@ -23,8 +28,6 @@ public partial class MainWindow : Window
         ChatsList.ItemsSource = _chats;
         MessagesList.ItemsSource = _messages;
         Loaded += Window_Loaded;
-        _syncTimer.Tick += async (_, _) => await SyncSelectedChatAsync(false);
-        _syncTimer.Start();
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -51,8 +54,8 @@ public partial class MainWindow : Window
     private async Task ShowWorkspaceAsync()
     {
         LoginPane.Visibility = Visibility.Collapsed; Workspace.Visibility = Visibility.Visible;
-        LoginStatus.Text = ""; ConnectionState.Text = "●  подключено";
-        ConnectionState.Foreground = System.Windows.Media.Brushes.LightGreen;
+        LoginStatus.Text = ""; ConnectionState.Text = "●  подключаюсь…";
+        ConnectionState.Foreground = System.Windows.Media.Brushes.Orange;
         await LoadConversationsAsync();
     }
 
@@ -103,9 +106,100 @@ public partial class MainWindow : Window
     private async void ChatsList_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         if (ChatsList.SelectedItem is not ChatItem chat) return;
+        _realtimeCancellation?.Cancel();
+        _realtimeCancellation?.Dispose();
+        _realtimeCancellation = new CancellationTokenSource();
+        _peerOnline = false;
         _activeChat = chat; PeerName.Text = chat.Name; PeerUsername.Text = string.IsNullOrWhiteSpace(chat.Username) ? "" : "@" + chat.Username;
         _messages.Clear(); foreach (var message in _store.Load(chat.Id)) _messages.Add(message);
         await SyncSelectedChatAsync(true);
+        _ = RealtimeLoopAsync(chat, _realtimeCancellation.Token);
+    }
+
+    private async Task RealtimeLoopAsync(ChatItem chat, CancellationToken cancellationToken)
+    {
+        var retryDelay = TimeSpan.FromSeconds(1);
+        while (!cancellationToken.IsCancellationRequested && _activeChat?.Id == chat.Id)
+        {
+            try
+            {
+                using var socket = await _client.ConnectRealtimeAsync(chat.Id, cancellationToken);
+                await Dispatcher.InvokeAsync(() => SetConnection("●  онлайн", true));
+                await SyncSelectedChatAsync(false);
+                using var pingCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                var pingTask = SendRealtimePingsAsync(socket, pingCancellation.Token);
+                retryDelay = TimeSpan.FromSeconds(1);
+                try
+                {
+                    while (!cancellationToken.IsCancellationRequested && socket.State == WebSocketState.Open)
+                    {
+                        using var eventDocument = await _client.ReceiveRealtimeEventAsync(socket, cancellationToken);
+                        if (eventDocument is null) break;
+                        await Dispatcher.InvokeAsync(() => HandleRealtimeEvent(chat, eventDocument.RootElement));
+                    }
+                }
+                finally
+                {
+                    pingCancellation.Cancel();
+                    try { await pingTask; } catch (OperationCanceledException) { }
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { break; }
+            catch
+            {
+                await Dispatcher.InvokeAsync(() => SetConnection("●  переподключение…", false));
+                await SyncSelectedChatAsync(false);
+                try { await Task.Delay(retryDelay, cancellationToken); }
+                catch (OperationCanceledException) { break; }
+                retryDelay = TimeSpan.FromSeconds(Math.Min(30, retryDelay.TotalSeconds * 2));
+            }
+        }
+    }
+
+    private async Task SendRealtimePingsAsync(ClientWebSocket socket, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested && socket.State == WebSocketState.Open)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(20), cancellationToken);
+            if (socket.State != WebSocketState.Open) return;
+            var ping = System.Text.Encoding.UTF8.GetBytes("{\"type\":\"ping\"}");
+            await socket.SendAsync(ping, WebSocketMessageType.Text, true, cancellationToken);
+            try { await _client.HeartbeatAsync(cancellationToken); } catch { }
+        }
+    }
+
+    private void HandleRealtimeEvent(ChatItem chat, JsonElement payload)
+    {
+        if (_activeChat?.Id != chat.Id || !payload.TryGetProperty("type", out var typeValue)) return;
+        var type = typeValue.GetString();
+        if (type == "presence" && payload.TryGetProperty("online", out var online))
+        {
+            _peerOnline = online.GetBoolean();
+            PeerUsername.Text = (string.IsNullOrWhiteSpace(chat.Username) ? "" : "@" + chat.Username + "  ·  ") + (_peerOnline ? "в сети" : "не в сети");
+            return;
+        }
+        if (type == "typing" && payload.TryGetProperty("typing", out var typing))
+        {
+            PeerUsername.Text = typing.GetBoolean() ? "печатает…" : (string.IsNullOrWhiteSpace(chat.Username) ? "" : "@" + chat.Username + "  ·  ") + (_peerOnline ? "в сети" : "не в сети");
+            return;
+        }
+        if (type == "message" && payload.TryGetProperty("message", out var incoming))
+        {
+            var message = _client.ParseRealtimeMessage(incoming);
+            if (_messages.All(item => item.Id != message.Id))
+            {
+                _messages.Add(message); _store.Save(chat.Id, _messages); MessagesScroll.ScrollToEnd();
+            }
+            return;
+        }
+        if (type == "sync") _ = SyncSelectedChatAsync(false);
+        else if (type == "call_invite") ShowToast("Входящий звонок. Звонки Windows-клиента пока не поддерживаются.");
+    }
+
+    private void SetConnection(string label, bool online)
+    {
+        ConnectionState.Text = label;
+        ConnectionState.Foreground = online ? System.Windows.Media.Brushes.LightGreen : System.Windows.Media.Brushes.Orange;
     }
 
     private async Task SyncSelectedChatAsync(bool reportErrors)
@@ -149,11 +243,53 @@ public partial class MainWindow : Window
         finally { SendButton.IsEnabled = true; }
     }
 
+    private async void File_Click(object sender, RoutedEventArgs e)
+    {
+        if (_activeChat is null) { ShowToast("Сначала выбери чат"); return; }
+        var dialog = new OpenFileDialog { Title = "Выбрать файл для отправки", CheckFileExists = true, Multiselect = false };
+        if (dialog.ShowDialog(this) != true) return;
+        FileButton.IsEnabled = false; FileButton.Content = "Загрузка…";
+        try
+        {
+            var chat = _activeChat;
+            var sent = await _client.SendAttachmentAsync(chat, dialog.FileName, MessageBox.Text.Trim());
+            if (_activeChat?.Id == chat.Id)
+            {
+                if (_messages.All(item => item.Id != sent.Id)) _messages.Add(sent);
+                _store.Save(chat.Id, _messages); MessagesScroll.ScrollToEnd(); MessageBox.Clear();
+            }
+            ShowToast("Файл отправлен");
+        }
+        catch (Exception error) { ShowToast("Не удалось отправить файл: " + error.Message); }
+        finally { FileButton.IsEnabled = true; FileButton.Content = "Файл"; }
+    }
+
+    private async void DownloadAttachment_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Button { Tag: ChatMessage message } || string.IsNullOrWhiteSpace(message.AttachmentId)) return;
+        var dialog = new SaveFileDialog { FileName = Path.GetFileName(message.AttachmentName ?? "salom-file") };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            await _client.DownloadAttachmentAsync(message.AttachmentId, dialog.FileName);
+            ShowToast("Файл сохранён");
+        }
+        catch (Exception error) { ShowToast("Не удалось скачать файл: " + error.Message); }
+    }
+
     private void SignOut_Click(object sender, RoutedEventArgs e)
     {
+        _realtimeCancellation?.Cancel();
         _client.SignOut(); _activeChat = null; _chats.Clear(); _messages.Clear();
         Workspace.Visibility = Visibility.Collapsed; LoginPane.Visibility = Visibility.Visible;
         ConnectionState.Text = "●  отключено"; LoginStatus.Text = "Ты вышел из аккаунта на этом компьютере.";
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _realtimeCancellation?.Cancel();
+        _realtimeCancellation?.Dispose();
+        base.OnClosed(e);
     }
 
     private async void ShowToast(string message)

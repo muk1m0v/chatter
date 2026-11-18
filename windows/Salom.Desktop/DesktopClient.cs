@@ -6,9 +6,11 @@ using System.Text.Json;
 using System.Web;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Net.WebSockets;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Net.Http.Headers;
 
 namespace Salom.Desktop;
 
@@ -112,11 +114,87 @@ internal sealed class DesktopClient
         return ParseMessage(json.RootElement);
     }
 
+    internal async Task<ChatMessage> SendAttachmentAsync(ChatItem peer, string path, string text)
+    {
+        var info = new FileInfo(path);
+        const long maxFileBytes = 25L * 1024 * 1024;
+        if (!info.Exists || info.Length is <= 0 or > maxFileBytes) throw new InvalidOperationException("Файл должен быть размером от 1 байта до 25 МБ.");
+        var uploadPath = "attachments?peer_id=" + Uri.EscapeDataString(peer.Id) + "&name=" + Uri.EscapeDataString(info.Name) + "&kind=file";
+        using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(_apiBase, uploadPath));
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _session);
+        var file = new ByteArrayContent(await File.ReadAllBytesAsync(path));
+        file.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        request.Content = file;
+        using var response = await _http.SendAsync(request);
+        using var metadata = await ReadJsonAsync(response);
+        var attachmentId = metadata.RootElement.GetProperty("id").GetString();
+        using var sent = await PostAsync("messages", new { recipient_id = peer.Id, client_id = Guid.NewGuid().ToString(), text, attachment_id = attachmentId });
+        return ParseMessage(sent.RootElement);
+    }
+
+    internal async Task DownloadAttachmentAsync(string attachmentId, string destination, CancellationToken cancellationToken = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(_apiBase, "attachments/" + Uri.EscapeDataString(attachmentId)));
+        if (string.IsNullOrWhiteSpace(_session)) throw new InvalidOperationException("Сначала войдите в аккаунт.");
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _session);
+        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
+        await using var output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None, 65536, useAsync: true);
+        await input.CopyToAsync(output, cancellationToken);
+    }
+
+    internal async Task<ClientWebSocket> ConnectRealtimeAsync(string peerId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_session)) throw new InvalidOperationException("Сначала войдите в аккаунт.");
+        var builder = new UriBuilder(new Uri(_apiBase, "ws"))
+        {
+            Scheme = _apiBase.Scheme == Uri.UriSchemeHttps ? "wss" : "ws",
+            Port = _apiBase.IsDefaultPort ? -1 : _apiBase.Port
+        };
+        var socket = new ClientWebSocket();
+        socket.Options.SetRequestHeader("Authorization", "Bearer " + _session);
+        await socket.ConnectAsync(builder.Uri, cancellationToken);
+        var subscribe = JsonSerializer.SerializeToUtf8Bytes(new { type = "subscribe", peer_id = peerId });
+        await socket.SendAsync(subscribe, WebSocketMessageType.Text, true, cancellationToken);
+        return socket;
+    }
+
+    internal async Task HeartbeatAsync(CancellationToken cancellationToken = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(_apiBase, "presence"));
+        if (string.IsNullOrWhiteSpace(_session)) throw new InvalidOperationException("Сначала войдите в аккаунт.");
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _session);
+        using var response = await _http.SendAsync(request, cancellationToken);
+        response.EnsureSuccessStatusCode();
+    }
+
+    internal async Task<JsonDocument?> ReceiveRealtimeEventAsync(ClientWebSocket socket, CancellationToken cancellationToken)
+    {
+        using var payload = new MemoryStream();
+        var buffer = new byte[8192];
+        WebSocketReceiveResult result;
+        do
+        {
+            result = await socket.ReceiveAsync(buffer, cancellationToken);
+            if (result.MessageType == WebSocketMessageType.Close) return null;
+            if (result.MessageType != WebSocketMessageType.Text) continue;
+            payload.Write(buffer, 0, result.Count);
+            if (payload.Length > 65536) throw new InvalidDataException("Событие слишком большое.");
+        } while (!result.EndOfMessage);
+        return JsonDocument.Parse(payload.ToArray());
+    }
+
+    internal ChatMessage ParseRealtimeMessage(JsonElement message) => ParseMessage(message);
+
     private ChatMessage ParseMessage(JsonElement m)
     {
         var seconds = m.GetProperty("created").GetDouble();
+        var attachment = m.TryGetProperty("attachment", out var value) && value.ValueKind == JsonValueKind.Object ? value : default;
         return new ChatMessage(m.GetProperty("id").GetInt64(), m.GetProperty("text").GetString() ?? "",
-            m.GetProperty("sender_id").GetString() == _profileId, DateTimeOffset.FromUnixTimeMilliseconds((long)(seconds * 1000)).LocalDateTime);
+            m.GetProperty("sender_id").GetString() == _profileId, DateTimeOffset.FromUnixTimeMilliseconds((long)(seconds * 1000)).LocalDateTime,
+            attachment.ValueKind == JsonValueKind.Object ? attachment.GetProperty("id").GetString() : null,
+            attachment.ValueKind == JsonValueKind.Object ? attachment.GetProperty("name").GetString() : null);
     }
 
     private Task<JsonDocument> GetAsync(string path) => SendAsync(HttpMethod.Get, path, null, true);
@@ -169,7 +247,10 @@ internal sealed class ChatMessage
     public string TimeLabel => Created.ToString("HH:mm");
     public string Alignment => IsMine ? "Right" : "Left";
     public string BubbleBrush => IsMine ? "#4D3D05" : "#202B38";
-    internal ChatMessage(long id, string text, bool mine, DateTime created) { Id = id; Text = text; IsMine = mine; Created = created; }
+    public string? AttachmentId { get; }
+    public string? AttachmentName { get; }
+    public bool HasAttachment => !string.IsNullOrWhiteSpace(AttachmentId);
+    internal ChatMessage(long id, string text, bool mine, DateTime created, string? attachmentId = null, string? attachmentName = null) { Id = id; Text = text; IsMine = mine; Created = created; AttachmentId = attachmentId; AttachmentName = attachmentName; }
 }
 
 internal static class SessionVault

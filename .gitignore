@@ -20,6 +20,7 @@ dist/
 # Android / Gradle generated and machine-specific files
 .gradle/
 .gradle-home/
+.gradle-user/
 .nuget-packages/
 .salom-package-stage/
 android/.android-home/
