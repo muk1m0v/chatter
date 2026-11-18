@@ -243,6 +243,8 @@ async def redis_event_relay(application):
             await asyncio.sleep(1)
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+CALL_RING_SECONDS = 45
+CALL_MAX_DURATION_SECONDS = 4 * 60 * 60
 
 def publish_realtime(profile_id: str, event: dict) -> None:
     hub = getattr(app.state, 'realtime', None)
@@ -628,13 +630,13 @@ def create_call(body: CallCreateInput, authorization: str | None = Header(defaul
         active = db.execute("SELECT 1 FROM call_sessions WHERE state IN ('ringing','accepted') AND expires>? AND (caller_id IN (?,?) OR callee_id IN (?,?)) LIMIT 1", (now, me['id'],peer_id,me['id'],peer_id)).fetchone()
         if active: raise HTTPException(409, 'У одного из участников уже идёт звонок')
         db.execute('DELETE FROM call_sessions WHERE created<?', (now - 30 * 86400,))
-        db.execute('INSERT INTO call_sessions(id,caller_id,callee_id,state,created,updated,expires) VALUES(?,?,?,\'ringing\',?,?,?)', (call_id,me['id'],peer_id,now,now,now+45))
+        db.execute('INSERT INTO call_sessions(id,caller_id,callee_id,state,created,updated,expires) VALUES(?,?,?,\'ringing\',?,?,?)', (call_id,me['id'],peer_id,now,now,now+CALL_RING_SECONDS))
         db.execute('INSERT INTO call_push_jobs(call_id) VALUES(?)', (call_id,))
         caller_name = me['name']
-    publish_realtime(peer_id, {'type':'call_invite','peer_id':me['id'],'call_id':call_id,'caller_name':caller_name,'expires_at':now+45})
+    publish_realtime(peer_id, {'type':'call_invite','peer_id':me['id'],'call_id':call_id,'caller_name':caller_name,'expires_at':now+CALL_RING_SECONDS})
     dispatcher = getattr(app.state, 'push', None)
     if dispatcher: dispatcher.wake.set()
-    return {'call_id':call_id,'state':'ringing','expires_at':now+45}
+    return {'call_id':call_id,'state':'ringing','expires_at':now+CALL_RING_SECONDS}
 
 @app.post('/calls/{call_id}/state')
 def update_call(call_id: str, body: CallStateInput, authorization: str | None = Header(default=None)):
@@ -647,13 +649,16 @@ def update_call(call_id: str, body: CallStateInput, authorization: str | None = 
         if not call or me['id'] not in (call['caller_id'], call['callee_id']): raise HTTPException(404, 'Звонок не найден')
         state = call['state']; action = body.action
         if state == 'ringing' and call['expires'] <= now: state = 'missed'
-        if action == 'accept' and me['id'] == call['callee_id'] and state == 'ringing': state = 'accepted'
+        call_expires = call['expires']
+        if action == 'accept' and me['id'] == call['callee_id'] and state == 'ringing':
+            state = 'accepted'
+            call_expires = now + CALL_MAX_DURATION_SECONDS
         elif action == 'decline' and me['id'] == call['callee_id'] and state == 'ringing': state = 'declined'
         elif action == 'cancel' and me['id'] == call['caller_id'] and state == 'ringing': state = 'cancelled'
         elif action == 'end' and state in ('accepted','ringing'): state = 'ended'
         elif action == 'missed' and me['id'] == call['callee_id'] and state == 'missed': state = 'missed'
         else: raise HTTPException(409, 'Это действие уже недоступно')
-        db.execute('UPDATE call_sessions SET state=?,updated=?,ended_by=? WHERE id=?', (state,now,me['id'] if state in ('declined','cancelled','ended','missed') else None,call_id))
+        db.execute('UPDATE call_sessions SET state=?,updated=?,ended_by=?,expires=? WHERE id=?', (state,now,me['id'] if state in ('declined','cancelled','ended','missed') else None,call_expires,call_id))
         peer_id = call['callee_id'] if me['id'] == call['caller_id'] else call['caller_id']
     publish_realtime(peer_id, {'type':'call_state','peer_id':me['id'],'call_id':call_id,'state':state})
     return {'call_id':call_id,'state':state}

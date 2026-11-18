@@ -25,6 +25,10 @@ dist/
 .salom-package-stage/
 android/.android-home/
 windows/**/bin/
+windows/**/artifacts/
+windows/Salom.Setup/payload/
+outputs/*.apk
+outputs/*.exe
 windows/**/obj/
 .kotlin/
 build/

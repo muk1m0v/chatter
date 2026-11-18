@@ -132,6 +132,12 @@ internal sealed class DesktopClient
         return ParseMessage(sent.RootElement);
     }
 
+    internal async Task<JsonDocument> CreateCallAsync(string peerId) => await PostAsync("calls", new { peer_id = peerId });
+    internal async Task<JsonDocument> UpdateCallAsync(string callId, string action) => await PostAsync("calls/" + Uri.EscapeDataString(callId) + "/state", new { action });
+    internal async Task<JsonDocument> CallConfigAsync() => await GetAsync("calls/config");
+    internal async Task SignalCallAsync(string callId, string kind, JsonElement payload) =>
+        _ = await PostAsync("calls/" + Uri.EscapeDataString(callId) + "/signal", new { kind, payload });
+
     internal async Task DownloadAttachmentAsync(string attachmentId, string destination, CancellationToken cancellationToken = default)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(_apiBase, "attachments/" + Uri.EscapeDataString(attachmentId)));
@@ -155,7 +161,7 @@ internal sealed class DesktopClient
         var socket = new ClientWebSocket();
         socket.Options.SetRequestHeader("Authorization", "Bearer " + _session);
         await socket.ConnectAsync(builder.Uri, cancellationToken);
-        var subscribe = JsonSerializer.SerializeToUtf8Bytes(new { type = "subscribe", peer_id = peerId });
+        var subscribe = JsonSerializer.SerializeToUtf8Bytes(new { type = "subscribe", peer_id = "*" });
         await socket.SendAsync(subscribe, WebSocketMessageType.Text, true, cancellationToken);
         return socket;
     }

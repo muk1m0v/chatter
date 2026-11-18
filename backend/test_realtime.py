@@ -73,6 +73,45 @@ class RealtimeHubTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(bob_task, 1)
         self.assertEqual(hub.connection_count, 0)
 
+    async def test_wildcard_subscription_receives_all_account_events(self):
+        hub = RealtimeHub()
+        user, alice, bob = str(uuid4()), str(uuid4()), str(uuid4())
+        socket = Socket()
+        task = asyncio.create_task(hub.serve(socket, user))
+        await asyncio.wait_for(socket.accepted.wait(), 1)
+        self.assertEqual(await asyncio.wait_for(socket.sent.get(), 1), {"type": "ready"})
+        await socket.incoming.put({"type": "subscribe", "peer_id": "*"})
+        for _ in range(20):
+            if hub.subscriptions.get(socket) == "*": break
+            await asyncio.sleep(0)
+        self.assertEqual(await asyncio.wait_for(socket.sent.get(), 1), {"type": "subscribed", "peer_id": "*"})
+        for peer_id, message_id in ((alice, 21), (bob, 22)):
+            event = {"type": "message", "peer_id": peer_id, "message": {"id": message_id}}
+            await hub.publish(user, event)
+            self.assertEqual(await asyncio.wait_for(socket.sent.get(), 1), event)
+        await socket.incoming.put(None)
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(hub.connection_count, 0)
+
+    async def test_wildcard_subscription_can_send_typing_only_to_valid_profile(self):
+        hub = RealtimeHub()
+        user, peer = str(uuid4()), str(uuid4())
+        sender_socket = Socket()
+        sender_task = asyncio.create_task(hub.serve(sender_socket, user))
+        await asyncio.wait_for(sender_socket.accepted.wait(), 1)
+        await sender_socket.sent.get()
+        await sender_socket.incoming.put({"type": "subscribe", "peer_id": "*"})
+        await sender_socket.sent.get()
+
+        peer_socket, peer_task = await self.connect(hub, peer, user)
+        while not sender_socket.sent.empty(): sender_socket.sent.get_nowait()
+        await sender_socket.incoming.put({"type": "typing", "peer_id": peer, "typing": True})
+        self.assertEqual(await asyncio.wait_for(peer_socket.sent.get(), 1), {"type": "typing", "peer_id": user, "typing": True})
+        await sender_socket.incoming.put(None)
+        await peer_socket.incoming.put(None)
+        await asyncio.wait_for(sender_task, 1)
+        await asyncio.wait_for(peer_task, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
