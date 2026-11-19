@@ -11,6 +11,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 
 namespace Salom.Desktop;
 
@@ -18,11 +19,13 @@ internal sealed class DesktopClient
 {
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(20) };
     private readonly Uri _apiBase;
+    private readonly DesktopAuthSettings _authSettings;
     private string? _session;
     private string? _profileId;
 
     internal DesktopClient()
     {
+        _authSettings = DesktopAuthSettings.Load();
         var raw = Environment.GetEnvironmentVariable("SALOM_API_BASE_URL") ?? "https://mukimov.site/salom/api/";
         _apiBase = new Uri(raw.EndsWith('/') ? raw : raw + "/", UriKind.Absolute);
         if (_apiBase.Scheme != Uri.UriSchemeHttps && !_apiBase.IsLoopback) throw new InvalidOperationException("API должен использовать HTTPS.");
@@ -34,22 +37,19 @@ internal sealed class DesktopClient
     internal bool HasSession => !string.IsNullOrWhiteSpace(_session);
     internal async Task SignInAsync(string name, string username)
     {
-        var clientId = Environment.GetEnvironmentVariable("SALOM_GOOGLE_CLIENT_ID");
-        var clientSecret = Environment.GetEnvironmentVariable("SALOM_GOOGLE_CLIENT_SECRET");
-        var firebaseKey = Environment.GetEnvironmentVariable("SALOM_FIREBASE_WEB_API_KEY");
+        var clientId = _authSettings.GoogleClientId;
+        var clientSecret = _authSettings.GoogleClientSecret;
+        var firebaseKey = _authSettings.FirebaseWebApiKey;
         if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret) || string.IsNullOrWhiteSpace(firebaseKey))
-            throw new InvalidOperationException("Настрой SALOM_GOOGLE_CLIENT_ID, SALOM_GOOGLE_CLIENT_SECRET и SALOM_FIREBASE_WEB_API_KEY. Для Firebase нужен OAuth Google Desktop-клиент.");
+            throw new InvalidOperationException("Не найдена конфигурация Google Desktop/Firebase. Переустанови Салом из официального Setup.");
 
         var googleIdToken = await DesktopGoogleOAuth.GetIdTokenAsync(clientId, clientSecret);
-        var identityUrl = $"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={Uri.EscapeDataString(firebaseKey)}";
-        var postBody = "id_token=" + Uri.EscapeDataString(googleIdToken) + "&providerId=google.com";
-        using var firebaseResponse = await _http.PostAsJsonAsync(identityUrl, new
-        {
-            postBody,
-            requestUri = "http://localhost",
-            returnIdpCredential = true,
-            returnSecureToken = true
-        });
+        using var bridgeResponse = await _http.PostAsJsonAsync(new Uri(_apiBase, "auth/desktop/custom-token"), new { google_id_token = googleIdToken });
+        using var bridgeJson = await ReadJsonAsync(bridgeResponse);
+        var customToken = bridgeJson.RootElement.GetProperty("firebase_custom_token").GetString();
+        if (string.IsNullOrWhiteSpace(customToken)) throw new InvalidOperationException("Сервер не вернул Firebase token.");
+        var identityUrl = $"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={Uri.EscapeDataString(firebaseKey)}";
+        using var firebaseResponse = await _http.PostAsJsonAsync(identityUrl, new { token = customToken, returnSecureToken = true });
         using var firebaseJson = await ReadJsonAsync(firebaseResponse);
         var firebaseToken = firebaseJson.RootElement.GetProperty("idToken").GetString()!;
 
@@ -283,31 +283,95 @@ internal static class SessionVault
     internal static void Delete() { try { File.Delete(PathName); } catch { } }
 }
 
+internal sealed record DesktopAuthSettings(string? GoogleClientId, string? GoogleClientSecret, string? FirebaseWebApiKey)
+{
+    internal static DesktopAuthSettings Load()
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "salom.oauth.json")));
+            var root = document.RootElement;
+            return new DesktopAuthSettings(
+                Environment.GetEnvironmentVariable("SALOM_GOOGLE_CLIENT_ID") ?? Value(root, "googleClientId"),
+                Environment.GetEnvironmentVariable("SALOM_GOOGLE_CLIENT_SECRET") ?? Value(root, "googleClientSecret"),
+                Environment.GetEnvironmentVariable("SALOM_FIREBASE_WEB_API_KEY") ?? Value(root, "firebaseWebApiKey"));
+        }
+        catch (FileNotFoundException)
+        {
+            return new DesktopAuthSettings(
+                Environment.GetEnvironmentVariable("SALOM_GOOGLE_CLIENT_ID"),
+                Environment.GetEnvironmentVariable("SALOM_GOOGLE_CLIENT_SECRET"),
+                Environment.GetEnvironmentVariable("SALOM_FIREBASE_WEB_API_KEY"));
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return new DesktopAuthSettings(null, null, null);
+        }
+        catch (JsonException)
+        {
+            return new DesktopAuthSettings(null, null, null);
+        }
+    }
+
+    private static string? Value(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+}
+
 internal static class DesktopGoogleOAuth
 {
     internal static async Task<string> GetIdTokenAsync(string clientId, string clientSecret)
     {
-        const string redirect = "http://127.0.0.1:51824/";
         var verifier = Base64Url(RandomNumberGenerator.GetBytes(32));
         var challenge = Base64Url(SHA256.HashData(Encoding.ASCII.GetBytes(verifier)));
         var state = Base64Url(RandomNumberGenerator.GetBytes(24));
-        using var listener = new HttpListener();
-        listener.Prefixes.Add(redirect);
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var redirect = $"http://127.0.0.1:{port}/";
         var query = HttpUtility.ParseQueryString(string.Empty);
         query["client_id"] = clientId; query["redirect_uri"] = redirect; query["response_type"] = "code";
         query["scope"] = "openid email profile"; query["code_challenge"] = challenge; query["code_challenge_method"] = "S256"; query["state"] = state;
         Process.Start(new ProcessStartInfo("https://accounts.google.com/o/oauth2/v2/auth?" + query) { UseShellExecute = true });
         using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(3));
-        var context = await listener.GetContextAsync().WaitAsync(timeout.Token);
-        var code = context.Request.QueryString["code"];
-        if (context.Request.QueryString["state"] != state || string.IsNullOrWhiteSpace(code))
+        using var callback = await listener.AcceptTcpClientAsync(timeout.Token);
+        await using var stream = callback.GetStream();
+        using var reader = new StreamReader(stream, Encoding.ASCII, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true);
+        var requestLine = await reader.ReadLineAsync(timeout.Token);
+        var headerBytes = 0;
+        string? header;
+        string? host = null;
+        while (!string.IsNullOrEmpty(header = await reader.ReadLineAsync(timeout.Token)))
         {
-            context.Response.StatusCode = 400;
-            await ReplyAsync(context, "Вход не завершён. Можно закрыть окно и попробовать ещё раз.");
-            throw new InvalidOperationException("Google-вход не завершён или state не совпал.");
+            headerBytes += header.Length;
+            if (headerBytes > 8192) throw new InvalidDataException("Слишком большой ответ OAuth.");
+            if (header.StartsWith("Host:", StringComparison.OrdinalIgnoreCase)) host = header[5..].Trim();
         }
-        await ReplyAsync(context, "Готово. Вернитесь в приложение Салом.");
+        var requestParts = requestLine?.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        if (requestParts is not { Length: 3 } || requestParts[0] != "GET" ||
+            !string.Equals(host, $"127.0.0.1:{port}", StringComparison.OrdinalIgnoreCase) ||
+            !requestParts[1].StartsWith('/'))
+        {
+            await ReplyAsync(stream, 400, "Неверный ответ OAuth. Закрой страницу и повтори вход.");
+            throw new InvalidOperationException("Получен неверный ответ Google OAuth.");
+        }
+        var callbackUri = new Uri(new Uri(redirect), requestParts[1]);
+        var callbackQuery = HttpUtility.ParseQueryString(callbackUri.Query);
+        var callbackError = callbackQuery["error"];
+        var code = callbackQuery["code"];
+        var returnedState = callbackQuery["state"];
+        if (!string.IsNullOrWhiteSpace(callbackError))
+        {
+            await ReplyAsync(stream, 400, "Вход Google отменён. Вернись в Салом и попробуй ещё раз.");
+            throw new InvalidOperationException("Вход Google отменён или отклонён.");
+        }
+        var expectedState = Encoding.UTF8.GetBytes(state);
+        var actualState = Encoding.UTF8.GetBytes(returnedState ?? "");
+        if (!CryptographicOperations.FixedTimeEquals(expectedState, actualState) || string.IsNullOrWhiteSpace(code))
+        {
+            await ReplyAsync(stream, 400, "Вход не завершён. Закрой страницу и попробуй ещё раз.");
+            throw new InvalidOperationException("Google OAuth state не совпал или код авторизации отсутствует.");
+        }
+        await ReplyAsync(stream, 200, "Готово. Вернись в приложение Салом.");
         using var http = new HttpClient();
         using var response = await http.PostAsync("https://oauth2.googleapis.com/token", new FormUrlEncodedContent(new Dictionary<string, string>
         {
@@ -320,11 +384,13 @@ internal static class DesktopGoogleOAuth
         return token.RootElement.GetProperty("id_token").GetString()!;
     }
 
-    private static async Task ReplyAsync(HttpListenerContext context, string message)
+    private static async Task ReplyAsync(NetworkStream stream, int status, string message)
     {
         var bytes = Encoding.UTF8.GetBytes("<!doctype html><meta charset=utf-8><title>Салом</title><body style='font:18px sans-serif;background:#151c24;color:#fff;padding:3em'>" + WebUtility.HtmlEncode(message) + "</body>");
-        context.Response.ContentType = "text/html; charset=utf-8"; context.Response.ContentLength64 = bytes.Length;
-        await context.Response.OutputStream.WriteAsync(bytes); context.Response.Close();
+        var header = Encoding.ASCII.GetBytes($"HTTP/1.1 {status} {(status == 200 ? "OK" : "Bad Request")}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n");
+        await stream.WriteAsync(header);
+        await stream.WriteAsync(bytes);
+        await stream.FlushAsync();
     }
 
     private static string Base64Url(byte[] bytes) => Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');

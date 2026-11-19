@@ -18,6 +18,7 @@ Environment=SALOM_REQUIRE_POSTGRES=1
 Environment=SALOM_REQUIRE_REDIS=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=GOOGLE_APPLICATION_CREDENTIALS=/etc/salom-api/firebase-admin.json
+Environment=SALOM_DESKTOP_GOOGLE_CLIENT_ID=733181062764-ppbrh2vo17h36ktjbnji7p1fl4u9p7vn.apps.googleusercontent.com
 StateDirectory=salom-api
 StateDirectoryMode=0700
 ExecStart=/opt/salom-api/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 18731 --workers 1 --limit-concurrency 24 --timeout-keep-alive 5 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1

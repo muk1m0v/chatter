@@ -23,6 +23,8 @@ USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9_]{3,23}$')
 EMAIL = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 firebase_request = GoogleRequest(session=CacheControl(requests.Session()))
 firebase_lock = threading.Lock()
+firebase_admin_lock = threading.Lock()
+firebase_admin_app = None
 
 def schema(db):
     # Keep previous columns intact so upgrading never discards existing identities.
@@ -63,7 +65,8 @@ def firebase_identity(token):
         with firebase_lock:
             claims = id_token.verify_firebase_token(token, firebase_request, audience=project)
         now = time.time()
-        if claims.get('firebase', {}).get('sign_in_provider') != 'google.com': raise ValueError()
+        provider = claims.get('firebase', {}).get('sign_in_provider')
+        if provider != 'google.com' and not (provider == 'custom' and claims.get('salom_google_verified') is True): raise ValueError()
         email = claims.get('email', '').strip().lower()
         if claims.get('email_verified') is not True or len(email) > 254 or not EMAIL.fullmatch(email): raise ValueError()
         if not claims.get('sub') or not 0 <= now - claims.get('auth_time', 0) <= 900: raise ValueError()
@@ -80,6 +83,50 @@ class IdentityProof(BaseModel):
     name: str = Field(default='', max_length=80)
     username: str = Field(default='', max_length=24)
     bind_current: bool = False
+
+class DesktopGoogleProof(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    google_id_token: str = Field(min_length=1, max_length=8192)
+
+def firebase_admin():
+    global firebase_admin_app
+    with firebase_admin_lock:
+        if firebase_admin_app is None:
+            import firebase_admin
+            from firebase_admin import credentials
+            credential_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', '/etc/salom-api/firebase-admin.json')
+            project = json.loads(Path(credential_path).read_text())['project_id']
+            try:
+                firebase_admin_app = firebase_admin.get_app('salom-desktop-auth')
+            except ValueError:
+                firebase_admin_app = firebase_admin.initialize_app(
+                    credentials.Certificate(credential_path), {'projectId': project}, name='salom-desktop-auth')
+        return firebase_admin_app
+
+def issue_desktop_firebase_token(google_claims):
+    from firebase_admin import auth as admin_auth
+    app_instance = firebase_admin()
+    email = google_claims['email'].strip().lower()
+    try:
+        user = admin_auth.get_user_by_email(email, app=app_instance)
+    except admin_auth.UserNotFoundError:
+        try:
+            user = admin_auth.create_user(email=email, email_verified=True,
+                display_name=(google_claims.get('name') or '')[:256] or None,
+                photo_url=(google_claims.get('picture') or '')[:2048] or None, app=app_instance)
+        except Exception:
+            # Handle simultaneous first sign-in without creating a second identity.
+            user = admin_auth.get_user_by_email(email, app=app_instance)
+    options = {'email_verified': True}
+    display_name = (google_claims.get('name') or '')[:256]
+    picture = google_claims.get('picture') or ''
+    parsed = urlparse(picture) if isinstance(picture, str) else None
+    if display_name: options['display_name'] = display_name
+    if parsed and parsed.scheme == 'https' and (parsed.hostname or '').endswith('googleusercontent.com') and len(picture) < 2048:
+        options['photo_url'] = picture
+    if not user.email_verified or options.get('display_name') or options.get('photo_url'):
+        admin_auth.update_user(user.uid, app=app_instance, **options)
+    return admin_auth.create_custom_token(user.uid, {'salom_google_verified': True}, app=app_instance).decode('utf-8')
 
 def install_routes(app, connect, current_profile, public, digest):
     def account_json(db, profile_id):
@@ -98,6 +145,21 @@ def install_routes(app, connect, current_profile, public, digest):
     @app.get('/auth/config')
     def config():
         return {'google_enabled': True, 'email_enabled': False, 'sms_enabled': False}
+
+    @app.post('/auth/desktop/custom-token')
+    def desktop_custom_token(proof: DesktopGoogleProof, request: Request):
+        limited(connect, 'desktop-google:' + ip_key(request), 20, 60)
+        client_id = os.environ.get('SALOM_DESKTOP_GOOGLE_CLIENT_ID', '').strip()
+        if not client_id: raise HTTPException(503, 'Вход с компьютера временно недоступен')
+        try:
+            claims = id_token.verify_oauth2_token(proof.google_id_token, firebase_request, audience=client_id)
+            email = claims.get('email', '').strip().lower()
+            if claims.get('email_verified') is not True or len(email) > 254 or not EMAIL.fullmatch(email) or not claims.get('sub'):
+                raise ValueError()
+            firebase_custom_token = issue_desktop_firebase_token(claims)
+            return {'firebase_custom_token': firebase_custom_token}
+        except Exception:
+            raise HTTPException(401, 'Вход Google недействителен. Выбери аккаунт ещё раз')
 
     @app.get('/auth/username')
     def username_available(request: Request, username: str = Query(min_length=1, max_length=24)):

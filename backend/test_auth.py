@@ -20,12 +20,18 @@ class AuthTests(unittest.TestCase):
         app.DB = Path(self.tmp.name) / 'auth.sqlite3'
         self.credentials = Path(self.tmp.name) / 'project.json'
         self.credentials.write_text(json.dumps({'project_id': 'qa-project'}))
-        self.env = patch.dict(os.environ, {'GOOGLE_APPLICATION_CREDENTIALS': str(self.credentials)})
+        self.env = patch.dict(os.environ, {'GOOGLE_APPLICATION_CREDENTIALS': str(self.credentials),
+                                           'SALOM_DESKTOP_GOOGLE_CLIENT_ID': 'desktop-client-id'})
         self.env.start()
         self.claims = {'sub': 'google-qa', 'email': 'qa@example.invalid', 'email_verified': True,
                        'auth_time': time.time(), 'firebase': {'sign_in_provider': 'google.com'}}
         self.verifier = patch('auth.id_token.verify_firebase_token', side_effect=lambda *a, **k: dict(self.claims))
         self.verify_mock = self.verifier.start()
+        self.google_claims = {'sub': 'desktop-google', 'email': 'desktop@example.invalid', 'email_verified': True, 'name': 'Desktop QA'}
+        self.google_verifier = patch('auth.id_token.verify_oauth2_token', side_effect=lambda *a, **k: dict(self.google_claims))
+        self.google_verify_mock = self.google_verifier.start()
+        self.custom_token = patch('auth.issue_desktop_firebase_token', return_value='firebase-custom-fixture')
+        self.custom_token_mock = self.custom_token.start()
         self.push = patch('app.PushDispatcher')
         self.push.start()
         self.client = TestClient(app.app)
@@ -33,7 +39,7 @@ class AuthTests(unittest.TestCase):
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
-        self.push.stop(); self.verifier.stop(); self.env.stop()
+        self.push.stop(); self.custom_token.stop(); self.google_verifier.stop(); self.verifier.stop(); self.env.stop()
         app.DB = self.previous_db
         self.tmp.cleanup()
 
@@ -80,6 +86,26 @@ class AuthTests(unittest.TestCase):
     def test_invalid_signature_is_rejected(self):
         self.verify_mock.side_effect = ValueError('invalid signature')
         self.assertEqual(self.login().status_code, 401)
+
+    def test_desktop_google_proof_is_verified_for_existing_client_and_bridged(self):
+        response = self.client.post('/auth/desktop/custom-token', json={'google_id_token': 'signed-google-id-token'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {'firebase_custom_token': 'firebase-custom-fixture'})
+        self.assertEqual(self.google_verify_mock.call_args.kwargs['audience'], 'desktop-client-id')
+        self.custom_token_mock.assert_called_once_with(self.google_claims)
+
+    def test_desktop_bridge_rejects_unverified_email_or_invalid_google_signature(self):
+        self.google_claims['email_verified'] = False
+        self.assertEqual(self.client.post('/auth/desktop/custom-token', json={'google_id_token': 'token'}).status_code, 401)
+        self.google_claims['email_verified'] = True
+        self.google_verify_mock.side_effect = ValueError('bad signature')
+        self.assertEqual(self.client.post('/auth/desktop/custom-token', json={'google_id_token': 'token'}).status_code, 401)
+
+    def test_firebase_custom_identity_requires_server_google_claim(self):
+        self.claims['firebase'] = {'sign_in_provider': 'custom'}
+        self.assertEqual(self.login(username='custom_qa', name='QA').status_code, 401)
+        self.claims['salom_google_verified'] = True
+        self.assertEqual(self.login(username='custom_qa', name='QA').status_code, 200)
 
     def test_username_required_then_relogin_keeps_identity(self):
         self.assertTrue(self.login().json()['needs_username'])
