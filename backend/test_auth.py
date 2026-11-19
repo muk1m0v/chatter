@@ -237,7 +237,7 @@ class AuthTests(unittest.TestCase):
         with app.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM profiles').fetchone()[0],1)
 
     def test_email_registration_ticket_is_single_use(self):
-        redis=MagicMock();redis.getdel.side_effect=['new@example.invalid',None]
+        redis=MagicMock();redis.get.return_value='new@example.invalid';redis.getdel.side_effect=['new@example.invalid',None]
         with patch.object(app.app.state,'redis_sync',redis,create=True):
             body={'email':'new@example.invalid','ticket':'t'*32,'name':'Email QA','username':'email_qa'}
             first=self.client.post('/auth/email/register',json=body)

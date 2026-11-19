@@ -14,6 +14,6 @@ Routes:
 
 - `POST /auth/email/code` with email: 300-second HMAC digest in Redis; 60-second resend lock; per-IP request limits.
 - `POST /auth/email/verify` with email and code: Redis Lua atomically counts attempts, blocks after five failures and consumes a valid code. Existing accounts receive a normal revocable SALOM session. New addresses receive a 300-second registration ticket.
-- `POST /auth/email/register` with email, ticket, name, username: consumes the ticket and creates a profile or returns the existing email owner. Username conflicts require a new email verification.
+- `POST /auth/email/register` with email, ticket, name, username: consumes the ticket and creates a profile or returns the existing email owner. Username conflicts can be corrected while the registration ticket is valid.
 
 Tests include hash/TTL storage, cooldown, invalid/expired/locked challenges, single-use registration and linking in both directions. The live Redis concurrency probe uses isolated random QA keys and cleans them afterwards. Physical Android/Windows user flows still require a mailbox/user test before claiming full end-to-end validation.

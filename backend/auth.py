@@ -221,7 +221,7 @@ redis.call('DEL',KEYS[1]); return 1
         username=body.username.strip()
         if not USERNAME.fullmatch(username): raise HTTPException(400,'Username: 4–24 латинские буквы, цифры и _, начинается с буквы')
         redis=redis_client(); ticket_key='salom:email-ticket:'+hashlib.sha256(body.ticket.encode()).hexdigest()
-        if redis.getdel(ticket_key)!=email: raise HTTPException(400,'Подтверждение email истекло. Запроси новый код')
+        if redis.get(ticket_key)!=email: raise HTTPException(400,'Подтверждение email истекло. Запроси новый код')
         now=time.time()
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -234,6 +234,7 @@ redis.call('DEL',KEYS[1]); return 1
                     db.execute('INSERT INTO profiles(id,token_hash,name,username,username_key,is_active,created,updated) VALUES(?,?,?,?,?,1,?,?)',(target,hash_token(secrets.token_urlsafe(32)),body.name.strip(),username,username.lower(),now,now))
                     db.execute('INSERT INTO accounts(profile_id,email,created) VALUES(?,?,?)',(target,email,now))
                 except INTEGRITY_ERRORS: raise HTTPException(409,'Этот username уже занят. Выбери другой')
+            if redis.getdel(ticket_key)!=email: raise HTTPException(400,'Подтверждение уже использовано. Запроси новый код')
             db.execute('INSERT INTO email_identities(profile_id) VALUES(?) ON CONFLICT(profile_id) DO NOTHING',(target,))
             db.execute('UPDATE profiles SET token_hash=? WHERE id=?',(hash_token(secrets.token_urlsafe(32)),target))
             return session(db,target)
