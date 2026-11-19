@@ -62,6 +62,23 @@ public partial class MainWindow : Window
         finally { GoogleButton.IsEnabled = true; }
     }
 
+    private async void EmailSignIn_Click(object sender, RoutedEventArgs e) {
+        var email = Interaction.InputBox("Email для входа:", "Салом · Email").Trim();
+        if (email.Length == 0) return;
+        try {
+            using var sent = await _client.EmailAsync("code", new { email });
+            var code = Interaction.InputBox("6 цифр из письма. Код действует 5 минут.", "Подтверждение Email").Trim();
+            if (code.Length == 0) return;
+            using var verified = await _client.EmailAsync("verify", new { email, code });
+            if (verified.RootElement.TryGetProperty("needs_username", out var needs) && needs.GetBoolean()) {
+                var username = Interaction.InputBox("Выбери username:", "Новый аккаунт");
+                var name = Interaction.InputBox("Твоё имя:", "Новый аккаунт", username);
+                using var registered = await _client.EmailAsync("register", new { email, ticket = verified.RootElement.GetProperty("ticket").GetString(), username, name });
+                _client.AcceptEmail(registered);
+            } else _client.AcceptEmail(verified);
+            await ShowWorkspaceAsync();
+        } catch (Exception error) { LoginStatus.Text = error.Message; }
+    }
     private async Task ShowWorkspaceAsync()
     {
         LoginPane.Visibility = Visibility.Collapsed; Workspace.Visibility = Visibility.Visible;

@@ -1,11 +1,12 @@
 param(
     [switch]$SkipTests,
+    [string]$SigningProfilePath,
     [ValidateSet('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')]
     [string[]]$Abis = @()
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$profilePath = Join-Path $env:LOCALAPPDATA 'SALOM\release-signing.dpapi'
+$profilePath = if ($SigningProfilePath) { $SigningProfilePath } else { Join-Path $env:LOCALAPPDATA 'SALOM\release-signing.dpapi' }
 if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw 'Protected SALOM signing profile was not found.' }
 
 $protected = [IO.File]::ReadAllBytes($profilePath)
@@ -23,7 +24,7 @@ try {
             & .\gradlew.bat :app:testDebugUnitTest --no-daemon
             if ($LASTEXITCODE -ne 0) { throw "Android unit tests failed ($LASTEXITCODE)." }
         }
-        $buildAbis = if ($Abis.Count -gt 0) { $Abis } else { @($null) }
+        $buildAbis = if ($Abis.Count -gt 0) { $Abis } else { @('') }
         $releaseDir = Join-Path $repo 'outputs'
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
         $sdk = $env:ANDROID_SDK_ROOT

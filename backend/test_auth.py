@@ -7,7 +7,7 @@ import secrets
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import uuid
 from fastapi.testclient import TestClient
 import app
@@ -194,5 +194,55 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(self.client.get('/auth/me', headers=self.headers(second)).status_code, 200)
         with app.connect() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM sessions WHERE token_hash=?', (account['session_token'],)).fetchone())
+
+    def test_email_code_is_hashed_and_has_five_minute_ttl(self):
+        redis=MagicMock(); redis.set.return_value=True
+        with patch.object(app.app.state,'redis_sync',redis,create=True), patch.dict(os.environ,{'BREVO_API_KEY':'fixture','BREVO_SENDER_EMAIL':'sender@example.invalid','SALOM_OTP_PEPPER':'x'*32}), patch('auth.requests.post') as mail:
+            response=self.client.post('/auth/email/code',json={'email':'qa@example.invalid'})
+            self.assertEqual(response.status_code,200,response.text)
+            challenge=json.loads(redis.set.call_args_list[1].args[1])
+            sent_code=mail.call_args.kwargs['json']['textContent'].split(': ')[1].split('.')[0]
+            self.assertEqual(challenge['digest'],auth.otp_digest('qa@example.invalid',sent_code))
+            self.assertNotIn(sent_code,redis.set.call_args_list[1].args[1])
+            self.assertEqual(redis.set.call_args_list[1].kwargs['ex'],300)
+            self.assertEqual(mail.call_args.args[0],'https://api.brevo.com/v3/smtp/email')
+
+    def test_email_resend_is_limited(self):
+        redis=MagicMock();redis.set.return_value=False
+        with patch.object(app.app.state,'redis_sync',redis,create=True), patch.dict(os.environ,{'BREVO_API_KEY':'fixture','BREVO_SENDER_EMAIL':'sender@example.invalid'}), patch('auth.requests.post') as mail:
+            self.assertEqual(self.client.post('/auth/email/code',json={'email':'qa@example.invalid'}).status_code,429)
+            mail.assert_not_called()
+
+    def test_email_verification_limits_expiry_and_reuses_google_account(self):
+        account=self.register()
+        redis=MagicMock()
+        with patch.object(app.app.state,'redis_sync',redis,create=True), patch.dict(os.environ,{'SALOM_OTP_PEPPER':'x'*32}):
+            for code,status in [(-1,400),(-2,429),(0,400)]:
+                redis.eval.return_value=code
+                self.assertEqual(self.client.post('/auth/email/verify',json={'email':'qa@example.invalid','code':'123456'}).status_code,status)
+            redis.eval.return_value=1
+            response=self.client.post('/auth/email/verify',json={'email':'qa@example.invalid','code':'123456'})
+            self.assertEqual(response.json()['profile']['id'],account['profile']['id'])
+            self.assertEqual(self.client.get('/auth/me',headers=self.headers(response.json())).status_code,200)
+            with app.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM profiles').fetchone()[0],1)
+
+    def test_google_links_to_verified_email_registration_without_new_profile(self):
+        profile,key=self.seed_legacy('email_user')
+        with app.connect() as db:
+            db.execute('INSERT INTO accounts(profile_id,email,created) VALUES(?,?,?)',(profile,self.claims['email'],time.time()))
+            db.execute('INSERT INTO email_identities(profile_id) VALUES(?)',(profile,))
+        result=self.login()
+        self.assertEqual(result.status_code,200,result.text)
+        self.assertEqual(result.json()['profile']['id'],profile)
+        with app.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM profiles').fetchone()[0],1)
+
+    def test_email_registration_ticket_is_single_use(self):
+        redis=MagicMock();redis.getdel.side_effect=['new@example.invalid',None]
+        with patch.object(app.app.state,'redis_sync',redis,create=True):
+            body={'email':'new@example.invalid','ticket':'t'*32,'name':'Email QA','username':'email_qa'}
+            first=self.client.post('/auth/email/register',json=body)
+            self.assertEqual(first.status_code,200,first.text)
+            self.assertEqual(self.client.post('/auth/email/register',json=body).status_code,400)
+            with app.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM profiles').fetchone()[0],1)
 
 if __name__ == '__main__': unittest.main()

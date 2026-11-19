@@ -14,13 +14,42 @@
       },
       "oauth_client": [
         {
-          "client_id": "740495426996-4ftp7lf6ar1ub5g3jnlh636ovq3hkcp6.apps.googleusercontent.com",
+          "client_id": "740495426996-fqag5sf84juo30tlqqsfmma24rbic0gu.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
             "package_name": "com.mukimov.salom",
-            "certificate_hash": "2ce82d4114aa17e0b8baba4fd91ea69922d74e01"
+            "certificate_hash": "07519fe7ddf3c1c4d31e46c405546c1f84f70095"
           }
         },
+        {
+          "client_id": "740495426996-mfgela6bi539e283vppofnjsrut9r120.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyABDRmWPKwgLbEuzrJjiEvNki8JuaTuYII"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "740495426996-mfgela6bi539e283vppofnjsrut9r120.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:740495426996:android:f1a78d452d6ee4dc26dee1",
+        "android_client_info": {
+          "package_name": "shop.strikeimpact.app"
+        }
+      },
+      "oauth_client": [
         {
           "client_id": "740495426996-mfgela6bi539e283vppofnjsrut9r120.apps.googleusercontent.com",
           "client_type": 3

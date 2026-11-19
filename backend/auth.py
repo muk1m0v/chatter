@@ -1,5 +1,6 @@
 """Google-only verified identities and revocable Salom device sessions."""
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -28,7 +29,7 @@ firebase_admin_app = None
 
 def schema(db):
     # Keep previous columns intact so upgrading never discards existing identities.
-    db.executescript('''
+    db.executescript('''CREATE TABLE IF NOT EXISTS email_identities (profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE);
       CREATE TABLE IF NOT EXISTS accounts (
         profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
         firebase_uid TEXT UNIQUE, phone TEXT UNIQUE, email TEXT UNIQUE,
@@ -88,6 +89,28 @@ class DesktopGoogleProof(BaseModel):
     model_config = ConfigDict(extra='forbid')
     google_id_token: str = Field(min_length=1, max_length=8192)
 
+class EmailCodeRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    email: str = Field(min_length=3, max_length=254)
+
+class EmailCodeProof(EmailCodeRequest):
+    code: str = Field(pattern=r'^\d{6}$')
+
+class EmailRegistration(EmailCodeRequest):
+    ticket: str = Field(min_length=20, max_length=256)
+    username: str = Field(min_length=4, max_length=24)
+    name: str = Field(min_length=1, max_length=80)
+
+def normalized_email(value):
+    email = value.strip().lower()
+    if len(email) > 254 or not EMAIL.fullmatch(email): raise HTTPException(400, 'Проверь адрес электронной почты')
+    return email
+
+def otp_digest(email, code):
+    pepper = os.environ.get('SALOM_OTP_PEPPER', '')
+    if len(pepper) < 32: raise HTTPException(503, 'Подтверждение email временно недоступно')
+    return hmac.new(pepper.encode(), f'{email}:{code}'.encode(), hashlib.sha256).hexdigest()
+
 def firebase_admin():
     global firebase_admin_app
     with firebase_admin_lock:
@@ -129,10 +152,15 @@ def issue_desktop_firebase_token(google_claims):
     return admin_auth.create_custom_token(user.uid, {'salom_google_verified': True}, app=app_instance).decode('utf-8')
 
 def install_routes(app, connect, current_profile, public, digest):
+    def redis_client():
+        client = getattr(app.state, 'redis_sync', None)
+        if client is None: raise HTTPException(503, 'Сервис временно недоступен')
+        return client
     def account_json(db, profile_id):
         row = db.execute('SELECT * FROM accounts WHERE profile_id=?', (profile_id,)).fetchone()
         linked = bool(row and row['google_linked'])
-        return {'verified': linked, 'google_linked': linked, 'email': (row['email'] or '') if row else ''}
+        email_verified = bool(db.execute('SELECT 1 FROM email_identities WHERE profile_id=?', (profile_id,)).fetchone())
+        return {'verified': linked or email_verified, 'google_linked': linked, 'email': (row['email'] or '') if row else ''}
 
     def session(db, profile_id):
         profile = db.execute('SELECT * FROM profiles WHERE id=?', (profile_id,)).fetchone()
@@ -144,7 +172,71 @@ def install_routes(app, connect, current_profile, public, digest):
 
     @app.get('/auth/config')
     def config():
-        return {'google_enabled': True, 'email_enabled': False, 'sms_enabled': False}
+        return {'google_enabled': True, 'email_enabled': bool(os.environ.get('BREVO_API_KEY') and os.environ.get('BREVO_SENDER_EMAIL') and os.environ.get('SALOM_OTP_PEPPER')), 'sms_enabled': False}
+
+    @app.post('/auth/email/code')
+    def send_email_code(body: EmailCodeRequest, request: Request):
+        email=normalized_email(body.email); limited(connect,'email-code-ip:'+ip_key(request),8,3600)
+        if not os.environ.get('BREVO_API_KEY') or not os.environ.get('BREVO_SENDER_EMAIL'):
+            raise HTTPException(503,'Отправка кодов временно не настроена')
+        redis=redis_client(); key='salom:email-otp:'+hashlib.sha256(email.encode()).hexdigest()
+        if not redis.set(key+':cooldown','1',nx=True,ex=60): raise HTTPException(429,'Подожди минуту перед повторной отправкой')
+        code=f'{secrets.randbelow(1_000_000):06d}'
+        redis.set(key,json.dumps({'digest':otp_digest(email,code),'attempts':0}),ex=300)
+        try:
+            response=requests.post('https://api.brevo.com/v3/smtp/email',headers={'api-key':os.environ['BREVO_API_KEY'],'accept':'application/json','content-type':'application/json'},json={'sender':{'email':os.environ['BREVO_SENDER_EMAIL'],'name':'Салом'},'to':[{'email':email}],'subject':'Код подтверждения Салом','textContent':f'Код подтверждения: {code}. Он действует 5 минут. Не сообщай его никому.'},timeout=8)
+            response.raise_for_status()
+        except requests.RequestException:
+            redis.delete(key,key+':cooldown')
+            raise HTTPException(502,'Не удалось отправить письмо. Проверь адрес и попробуй позже')
+        return {'sent':True,'expires_in':300,'resend_after':60}
+
+    @app.post('/auth/email/verify')
+    def verify_email_code(body: EmailCodeProof, request: Request):
+        email=normalized_email(body.email); limited(connect,'email-verify-ip:'+ip_key(request),30,3600)
+        redis=redis_client(); key='salom:email-otp:'+hashlib.sha256(email.encode()).hexdigest()
+        result=redis.eval("""
+local raw=redis.call('GET',KEYS[1]); if not raw then return -1 end
+local data=cjson.decode(raw)
+if data.attempts>=5 then return -2 end
+if data.digest~=ARGV[1] then
+ data.attempts=data.attempts+1
+ redis.call('SET',KEYS[1],cjson.encode(data),'KEEPTTL'); return 0
+end
+redis.call('DEL',KEYS[1]); return 1
+""",1,key,otp_digest(email,body.code))
+        if result==-1: raise HTTPException(400,'Код истёк. Запроси новый')
+        if result==-2: raise HTTPException(429,'Попытки закончились. Запроси новый код')
+        if result!=1: raise HTTPException(400,'Код неверный')
+        with connect() as db:
+            existing=db.execute('SELECT * FROM accounts WHERE email=?',(email,)).fetchone()
+            if existing: return session(db,existing['profile_id'])
+        ticket=secrets.token_urlsafe(32)
+        redis.set('salom:email-ticket:'+hashlib.sha256(ticket.encode()).hexdigest(),email,ex=300)
+        return {'needs_username':True,'ticket':ticket,'expires_in':300}
+
+    @app.post('/auth/email/register')
+    def register_email(body: EmailRegistration, request: Request):
+        email=normalized_email(body.email); limited(connect,'email-register-ip:'+ip_key(request),10,3600)
+        username=body.username.strip()
+        if not USERNAME.fullmatch(username): raise HTTPException(400,'Username: 4–24 латинские буквы, цифры и _, начинается с буквы')
+        redis=redis_client(); ticket_key='salom:email-ticket:'+hashlib.sha256(body.ticket.encode()).hexdigest()
+        if redis.getdel(ticket_key)!=email: raise HTTPException(400,'Подтверждение email истекло. Запроси новый код')
+        now=time.time()
+        with connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            existing=db.execute('SELECT * FROM accounts WHERE email=?',(email,)).fetchone()
+            if existing:
+                target=existing['profile_id']
+            else:
+                target=str(uuid.uuid4())
+                try:
+                    db.execute('INSERT INTO profiles(id,token_hash,name,username,username_key,is_active,created,updated) VALUES(?,?,?,?,?,1,?,?)',(target,hash_token(secrets.token_urlsafe(32)),body.name.strip(),username,username.lower(),now,now))
+                    db.execute('INSERT INTO accounts(profile_id,email,created) VALUES(?,?,?)',(target,email,now))
+                except INTEGRITY_ERRORS: raise HTTPException(409,'Этот username уже занят. Выбери другой')
+            db.execute('INSERT INTO email_identities(profile_id) VALUES(?) ON CONFLICT(profile_id) DO NOTHING',(target,))
+            db.execute('UPDATE profiles SET token_hash=? WHERE id=?',(hash_token(secrets.token_urlsafe(32)),target))
+            return session(db,target)
 
     @app.post('/auth/desktop/custom-token')
     def desktop_custom_token(proof: DesktopGoogleProof, request: Request):
@@ -187,7 +279,10 @@ def install_routes(app, connect, current_profile, public, digest):
             if email_owner and email_owner['firebase_uid'] not in (None, contact['firebase_uid']):
                 raise HTTPException(409, 'Этот email уже связан с другим аккаунтом Салом')
             if not owner and not existing and email_owner and email_owner['firebase_uid'] is None:
-                raise HTTPException(409, 'Сначала подключи Google из существующего профиля Салом')
+                verified_email=db.execute('SELECT 1 FROM email_identities WHERE profile_id=?',(email_owner['profile_id'],)).fetchone()
+                if not verified_email: raise HTTPException(409, 'Сначала подключи Google из существующего профиля Салом')
+                db.execute('UPDATE accounts SET firebase_uid=?,google_linked=1 WHERE profile_id=?',(contact['firebase_uid'],email_owner['profile_id']))
+                return session(db,email_owner['profile_id'])
             if owner:
                 target = owner['id']
                 valid_owner = db.execute('SELECT 1 FROM profiles p WHERE p.id=? AND p.is_active=1 AND (p.token_hash=? OR EXISTS(SELECT 1 FROM sessions s WHERE s.profile_id=p.id AND s.token_hash=? AND s.expires>?))',

@@ -62,6 +62,12 @@ internal sealed class DesktopClient
         SessionVault.Write(_session, _profileId ?? "");
     }
 
+    internal Task<JsonDocument> EmailAsync(string path, object body) => PostAsync("auth/email/" + path, body, authenticated: false);
+    internal void AcceptEmail(JsonDocument result) {
+        _session = result.RootElement.GetProperty("session_token").GetString();
+        _profileId = result.RootElement.GetProperty("profile").GetProperty("id").GetString();
+        SessionVault.Write(_session!, _profileId!);
+    }
     internal async Task ValidateSessionAsync()
     {
         if (!HasSession) return;

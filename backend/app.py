@@ -102,7 +102,7 @@ def initialize():
         }
         with connect() as db:
             # Additive call schema; safe to apply on existing PostgreSQL installs.
-            db.executescript('''CREATE TABLE IF NOT EXISTS call_sessions (
+            db.executescript('''CREATE TABLE IF NOT EXISTS email_identities (profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE);CREATE TABLE IF NOT EXISTS call_sessions (
               id TEXT PRIMARY KEY, caller_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
               callee_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
               state TEXT NOT NULL, created DOUBLE PRECISION NOT NULL, updated DOUBLE PRECISION NOT NULL,
