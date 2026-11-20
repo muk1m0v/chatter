@@ -19,13 +19,20 @@ public partial class SetupWindow : Window
         try
         {
             await Task.Run(InstallFiles);
-            // Keep shortcut paths ASCII: WScript.Shell can otherwise use the
-            // system ANSI code page and replace Cyrillic characters with '?'.
-            CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "SALOM"), "SALOM.lnk");
-            CreateShortcut(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "SALOM.lnk");
             var exe = Path.Combine(_installPath, "Salom.Desktop.exe");
             Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true });
-            MessageBox.Show(this, "Салом установлен.\n\nДля входа в Windows-версии нужны Desktop OAuth и Firebase Web API настройки.", "Готово", MessageBoxButton.OK, MessageBoxImage.Information);
+            // Keep shortcut paths ASCII: WScript.Shell can otherwise use the
+            // system ANSI code page and replace Cyrillic characters with '?'.
+            var shortcutWarning = "";
+            var shortcutTask = Task.Run(() => {
+                CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "SALOM"), "SALOM.lnk");
+                CreateShortcut(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "SALOM.lnk");
+            });
+            if (await Task.WhenAny(shortcutTask, Task.Delay(TimeSpan.FromSeconds(5))) != shortcutTask)
+                shortcutWarning = "\n\nЯрлык не создан: Windows не ответила вовремя. Открой Салом через установленный EXE.";
+            else try { await shortcutTask; }
+                catch (Exception shortcutError) { shortcutWarning = "\n\nЯрлык не создан: " + shortcutError.Message + "\nОткрой Салом через установленный EXE."; }
+            MessageBox.Show(this, "Салом установлен." + shortcutWarning, "Готово", MessageBoxButton.OK, MessageBoxImage.Information);
             Close();
         }
         catch (Exception ex) { InstallProgress.Visibility = Visibility.Collapsed; InstallButton.IsEnabled = true; CancelButton.IsEnabled = true; MessageBox.Show(this, "Не удалось установить Салом:\n" + ex.Message, "Ошибка установки", MessageBoxButton.OK, MessageBoxImage.Error); }

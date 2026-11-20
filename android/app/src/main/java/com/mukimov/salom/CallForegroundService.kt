@@ -54,7 +54,12 @@ internal class CallForegroundService : Service() {
             .setContentIntent(pending).addAction(0, "Завершить", pending).build()
         val cameraAllowed = androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
         val type = if (Build.VERSION.SDK_INT >= 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or if (cameraAllowed) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0 else if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+        } catch (failure: RuntimeException) {
+            android.util.Log.e("SalomCall", "Cannot start call foreground service", failure)
+            stopSelf(startId)
+        }
         return START_NOT_STICKY
     }
 

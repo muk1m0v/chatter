@@ -21,7 +21,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 internal class DirectoryException(message: String, val status: Int = 0) : Exception(message)
-internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
+internal data class ConversationPreview(val account: SalomAccount, val lastText: String, val unreadCount: Int = 0)
 internal data class MessageEvent(val id: Long, val messageId: Long, val kind: String, val message: Message? = null)
 internal data class MessageBatch(val messages: List<Message>, val receipts: Map<Long, String>, val events: List<MessageEvent>, val hasMore: Boolean, val clearedThrough: Long)
 internal data class RealtimeEvent(val type: String, val connected: Boolean = false, val online: Boolean? = null, val typing: Boolean? = null, val callId: String? = null, val peerId: String? = null, val callerName: String? = null, val state: String? = null, val signalKind: String? = null, val signalPayload: JSONObject? = null)
@@ -205,7 +205,7 @@ internal class DirectoryClient(context: Context) {
     suspend fun conversations(): List<ConversationPreview> = withContext(Dispatchers.IO) {
         syncLocal()
         val array = request("conversations").getJSONArray("conversations")
-        (0 until array.length()).map { val item = array.getJSONObject(it); ConversationPreview(account(item.getJSONObject("profile")), item.getString("last_text")) }
+        (0 until array.length()).map { val item = array.getJSONObject(it); ConversationPreview(account(item.getJSONObject("profile")), item.getString("last_text"), item.optInt("unread_count").coerceAtLeast(0)) }
     }
 
     suspend fun registerPush(pushToken: String, enabled: Boolean) = withContext(Dispatchers.IO) {

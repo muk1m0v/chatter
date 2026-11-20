@@ -5,8 +5,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <ApplicationIcon>assets\salom.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <Resource Include="assets\salom.ico" />
+    <Resource Include="assets\salom-logo-512.png" />
     <EmbeddedResource Include="payload\SalomDesktop.zip" LogicalName="Salom.Setup.SalomDesktop.zip" Condition="Exists('payload\SalomDesktop.zip')" />
   </ItemGroup>
 </Project>

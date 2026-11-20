@@ -22,6 +22,7 @@ import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /** Audio-only peer connection. Media stays between the two devices; only SDP/ICE is relayed by SALOM. */
@@ -50,7 +51,15 @@ internal class CallEngine(
     private var peer: PeerConnection? = null
     private val pendingIce = ConcurrentLinkedQueue<IceCandidate>()
     @Volatile private var remoteDescriptionReady = false
-    private var closed = false
+    @Volatile private var closed = false
+    private fun reportState(state: String) {
+        scope.launch(Dispatchers.Main.immediate) {
+            if (!closed) {
+                if (state == "connected") CallSessionManager.connected(callId)
+                onState(state)
+            }
+        }
+    }
 
     suspend fun prepare() {
         if (peer != null) return
@@ -74,7 +83,7 @@ internal class CallEngine(
         peer = factory.createPeerConnection(configuration, object : PeerConnection.Observer {
             override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                onState(when (state) {
+                reportState(when (state) {
                     PeerConnection.IceConnectionState.CONNECTED, PeerConnection.IceConnectionState.COMPLETED -> "connected"
                     PeerConnection.IceConnectionState.CHECKING -> "connecting"
                     PeerConnection.IceConnectionState.DISCONNECTED -> "reconnecting"
@@ -120,7 +129,7 @@ internal class CallEngine(
                 videoTrack = factory.createVideoTrack("salom-video", videoSource).also { it.setEnabled(true) }
                 peer?.addTrack(videoTrack, listOf("salom-call"))
                 localRenderer?.let { videoTrack?.addSink(it) }
-            }.onFailure { onState("video_unavailable") }
+            }.onFailure { reportState("video_unavailable") }
         }
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         audioManager.isSpeakerphoneOn = false
@@ -134,12 +143,12 @@ internal class CallEngine(
                 connection.setLocalDescription(object : SdpObserverAdapter() {}, description)
                 scope.launch {
                     runCatching { directory.signalCall(callId, "offer", JSONObject().put("type", description.type.canonicalForm()).put("sdp", description.description)) }
-                        .onFailure { onState("failed") }
+                        .onFailure { reportState("failed") }
                 }
             }
             override fun onSetSuccess() = Unit
-            override fun onCreateFailure(error: String) { onState("failed") }
-            override fun onSetFailure(error: String) { onState("failed") }
+            override fun onCreateFailure(error: String) { reportState("failed") }
+            override fun onSetFailure(error: String) { reportState("failed") }
         }, MediaConstraints())
     }
 
@@ -150,7 +159,7 @@ internal class CallEngine(
                 val remote = SessionDescription(SessionDescription.Type.OFFER, payload.optString("sdp"))
                 connection.setRemoteDescription(object : SdpObserverAdapter() {
                     override fun onSetSuccess() { remoteDescriptionReady = true; drainIce(connection); createAnswer() }
-                    override fun onSetFailure(error: String) { onState("failed") }
+                    override fun onSetFailure(error: String) { reportState("failed") }
                 }, remote)
             }
             "answer" -> connection.setRemoteDescription(object : SdpObserverAdapter() {
@@ -176,12 +185,12 @@ internal class CallEngine(
                 connection.setLocalDescription(object : SdpObserverAdapter() {}, description)
                 scope.launch {
                     runCatching { directory.signalCall(callId, "answer", JSONObject().put("type", description.type.canonicalForm()).put("sdp", description.description)) }
-                        .onFailure { onState("failed") }
+                        .onFailure { reportState("failed") }
                 }
             }
             override fun onSetSuccess() = Unit
-            override fun onCreateFailure(error: String) { onState("failed") }
-            override fun onSetFailure(error: String) { onState("failed") }
+            override fun onCreateFailure(error: String) { reportState("failed") }
+            override fun onSetFailure(error: String) { reportState("failed") }
         }, MediaConstraints())
     }
 
@@ -199,9 +208,8 @@ internal class CallEngine(
         closed = true
         runCatching { camera?.stopCapture(); camera?.dispose(); textureHelper?.dispose(); videoTrack?.setEnabled(false); videoTrack?.dispose(); videoSource?.dispose(); track?.setEnabled(false); track?.dispose(); source?.dispose(); peer?.close(); peer?.dispose() }
         camera = null; textureHelper = null; videoTrack = null; videoSource = null; track = null; source = null; peer = null
-        audioManager.mode = previousMode
-        audioManager.isSpeakerphoneOn = previousSpeaker
-        CallForegroundService.stop(app)
+        runCatching { audioManager.mode = previousMode; audioManager.isSpeakerphoneOn = previousSpeaker }
+        runCatching { CallForegroundService.stop(app) }
     }
 }
 

@@ -346,6 +346,9 @@ private fun Chats(context: Context, store: Store, accounts: List<SalomAccount>, 
                             Text(account.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(conversation.lastText, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
                         }
+                        if (conversation.unreadCount > 0) Box(Modifier.padding(start = 8.dp).clip(CircleShape).background(Yellow).defaultMinSize(minWidth = 22.dp, minHeight = 22.dp).padding(horizontal = 5.dp), contentAlignment = Alignment.Center) {
+                            Text(if (conversation.unreadCount > 99) "99+" else conversation.unreadCount.toString(), color = Ink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
                 if (search.isEmpty() && remoteChats.isEmpty()) item {

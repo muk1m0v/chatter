@@ -85,7 +85,8 @@ internal sealed class DesktopClient
         {
             var profile = item.GetProperty("profile");
             result.Add(new ChatItem(profile.GetProperty("id").GetString()!, profile.GetProperty("name").GetString()!,
-                profile.TryGetProperty("username", out var user) ? user.GetString() ?? "" : "", item.GetProperty("last_text").GetString() ?? ""));
+                profile.TryGetProperty("username", out var user) ? user.GetString() ?? "" : "", item.GetProperty("last_text").GetString() ?? "",
+                item.TryGetProperty("unread_count", out var unread) ? unread.GetInt32() : 0));
         }
         return result;
     }
@@ -245,9 +246,11 @@ internal sealed class DesktopClient
     }
 }
 
-internal sealed record ChatItem(string Id, string Name, string Username, string Preview)
+internal sealed record ChatItem(string Id, string Name, string Username, string Preview, int UnreadCount = 0)
 {
     public string Initial => string.IsNullOrWhiteSpace(Name) ? "С" : Name[..1].ToUpperInvariant();
+    public string UnreadLabel => UnreadCount > 99 ? "99+" : UnreadCount.ToString();
+    public System.Windows.Visibility UnreadVisibility => UnreadCount > 0 ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
 }
 
 internal sealed class ChatMessage

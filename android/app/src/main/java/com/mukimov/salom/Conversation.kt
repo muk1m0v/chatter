@@ -65,8 +65,6 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.UUID
 import android.Manifest
 import android.content.pm.PackageManager
-import android.media.Ringtone
-import android.media.RingtoneManager
 import android.os.Build
 import androidx.compose.ui.window.Dialog
 
@@ -141,20 +139,25 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             scope.launch {
                 try {
                     val result = directory.createCall(person.id)
+                    if (!CallSessionManager.incoming(result.getString("call_id"))) {
+                        runCatching { directory.updateCall(result.getString("call_id"), "cancel") }
+                        error("Другой звонок уже открыт")
+                    }
                     activeCall = CallPresentation(result.getString("call_id"), person.id, person.name, false, "ringing")
                     val engine = CallEngine(context, result.getString("call_id"), person.id, person.name, directory, scope) { state -> activeCall = activeCall?.copy(state = state) }
-                    engine.prepare(); callEngine = engine
+                    callEngine = engine; engine.prepare()
                     if (activeCall?.state == "accepted") { activeCall = activeCall?.copy(state = "connecting"); engine.createOffer() }
                 } catch (failure: Exception) {
+                    callEngine?.close(); callEngine = null
                     activeCall?.let { failed -> activeCall = failed.copy(state = "failed"); scope.launch { runCatching { directory.updateCall(failed.callId, "end") } } }
                     callError = failure.message ?: "Не удалось начать звонок"; sendError = callError
                 }
             }
         } else if (granted && call != null) scope.launch {
             runCatching {
-                if (call.incoming) { directory.updateCall(call.callId, "accept"); PushNotifications.cancelCall(context, call.callId) }
+                if (call.incoming) directory.updateCall(call.callId, "accept")
                 val engine = CallEngine(context, call.callId, call.peerId, call.peerName, directory, scope) { state -> activeCall = activeCall?.copy(state = state) }
-                engine.prepare(); callEngine = engine; callMuted = false; callSpeaker = false
+                callEngine = engine; engine.prepare(); callMuted = false; callSpeaker = false
                 activeCall = call.copy(state = if (call.incoming || call.state == "accepted") "connecting" else "ringing")
                 if (!call.incoming && call.state == "accepted") engine.createOffer()
                 val queued = pendingCallSignals; pendingCallSignals = emptyList()
@@ -165,7 +168,15 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 callError = "Не удалось подключить звонок: ${it.message ?: "проверь интернет"}"
                 scope.launch { runCatching { directory.updateCall(call.callId, "end") } }
             }
-        } else if (!granted) { pendingOutgoing = false; callError = "Для звонка нужно разрешить доступ к микрофону"; sendError = callError }
+        } else if (!granted) {
+            pendingOutgoing = false; callError = "Для звонка нужно разрешить доступ к микрофону"; sendError = callError
+            if (call?.incoming == true) {
+                PushNotifications.cancelCall(context, call.callId)
+                CallSessionManager.end(call.callId)
+                activeCall = null
+                scope.launch { runCatching { directory.updateCall(call.callId, "decline") } }
+            }
+        }
     }
     fun requestCallMicrophone() = callMicPermission.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
     fun startOutgoingCall() {
@@ -178,11 +189,16 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         scope.launch {
             try {
                 val result = directory.createCall(person.id)
+                if (!CallSessionManager.incoming(result.getString("call_id"))) {
+                    runCatching { directory.updateCall(result.getString("call_id"), "cancel") }
+                    error("Другой звонок уже открыт")
+                }
                 activeCall = CallPresentation(result.getString("call_id"), person.id, person.name, false, "ringing")
                 val engine = CallEngine(context, result.getString("call_id"), person.id, person.name, directory, scope) { state -> activeCall = activeCall?.copy(state = state) }
-                engine.prepare(); callEngine = engine
+                callEngine = engine; engine.prepare()
                 if (activeCall?.state == "accepted") { activeCall = activeCall?.copy(state = "connecting"); engine.createOffer() }
             } catch (failure: Exception) {
+                callEngine?.close(); callEngine = null
                 activeCall?.let { failed -> activeCall = failed.copy(state = "failed"); scope.launch { runCatching { directory.updateCall(failed.callId, "end") } } }
                 callError = failure.message ?: "Не удалось начать звонок"; sendError = callError
             }
@@ -190,6 +206,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     }
     fun endCall(action: String) {
         val call = activeCall ?: return
+        CallSessionManager.end(call.callId)
         activeCall = null; callEngine?.close(); callEngine = null; pendingCallSignals = emptyList()
         PushNotifications.cancelCall(context, call.callId)
         scope.launch {
@@ -202,9 +219,25 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     }
     LaunchedEffect(incomingCall, person.id) {
         incomingCall?.takeIf { it.peerId == person.id }?.let { call ->
+            if (activeCall != null && activeCall?.callId != call.callId) return@let
+            if (!CallSessionManager.incoming(call.callId) && CallSessionManager.current(call.callId) == null) {
+                onCallIntentHandled()
+                return@let
+            }
+            val existing = CallSessionManager.current(call.callId)
+            if (existing == CallSessionManager.State.CONNECTING || existing == CallSessionManager.State.CONNECTED) {
+                activeCall = activeCall ?: CallPresentation(call.callId, call.peerId, call.peerName, true,
+                    if (existing == CallSessionManager.State.CONNECTED) "connected" else "connecting")
+                onCallIntentHandled()
+                return@let
+            }
             activeCall = CallPresentation(call.callId, call.peerId, call.peerName, true, "incoming")
             onCallIntentHandled()
-            if (call.action == "accept") requestCallMicrophone()
+            if (call.action == "accept" && CallSessionManager.accept(call.callId)) {
+                PushNotifications.cancelCall(context, call.callId)
+                activeCall = activeCall?.copy(state = "connecting")
+                requestCallMicrophone()
+            }
             if (call.action == "decline") endCall("decline")
             if (call.action == "end") endCall("end")
         }
@@ -220,15 +253,6 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 else endCall(if (call.state == "ringing") "cancel" else "end")
             }
         }
-    }
-    DisposableEffect(activeCall?.callId, activeCall?.state) {
-        var ringtone: Ringtone? = null
-        if (activeCall?.state == "incoming") {
-            ringtone = RingtoneManager.getRingtone(context, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
-            if (Build.VERSION.SDK_INT >= 28) ringtone?.isLooping = true
-            ringtone?.play()
-        }
-        onDispose { runCatching { ringtone?.stop() } }
     }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val listState = rememberLazyListState()
@@ -451,14 +475,16 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                             "typing" -> peerTyping = event.typing ?: false
                             "presence" -> { peerOnline = event.online ?: false; retry++ }
                             "call_invite" -> if (event.callId != null && event.peerId == person.id && activeCall == null) {
-                                activeCall = CallPresentation(event.callId, person.id, event.callerName ?: person.name, true, "incoming")
+                                if (CallSessionManager.incoming(event.callId) || CallSessionManager.current(event.callId) == CallSessionManager.State.RINGING)
+                                    activeCall = CallPresentation(event.callId, person.id, event.callerName ?: person.name, true, "incoming")
                             }
                             "call_state" -> if (event.callId == activeCall?.callId && event.state != null) {
-                                if (event.state == "accepted" && activeCall?.incoming == false) {
+                                if (event.state == "accepted" && activeCall?.incoming == false && CallSessionManager.accept(event.callId.orEmpty())) {
                                     activeCall = activeCall?.copy(state = if (callEngine == null) "accepted" else "connecting")
                                     callEngine?.createOffer()
                                 } else if (event.state in setOf("declined", "cancelled", "ended", "missed")) {
                                     PushNotifications.cancelCall(context, event.callId.orEmpty())
+                                    CallSessionManager.end(event.callId.orEmpty())
                                     callEngine?.close(); callEngine = null; activeCall = null; onCallIntentHandled()
                                 }
                             }
@@ -804,7 +830,14 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     if (call.state == "incoming") {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                             FilledTonalButton(onClick = { endCall("decline") }) { Text("Отклонить") }
-                            Button(onClick = { callError = null; requestCallMicrophone() }) { Text("Ответить") }
+                            Button(onClick = {
+                                if (CallSessionManager.accept(call.callId)) {
+                                    PushNotifications.cancelCall(context, call.callId)
+                                    activeCall = activeCall?.copy(state = "connecting")
+                                    callError = null
+                                    requestCallMicrophone()
+                                }
+                            }) { Text("Ответить") }
                         }
                     } else {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {

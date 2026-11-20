@@ -1,0 +1,33 @@
+package com.mukimov.salom
+
+/** Process-wide call gate shared by FCM, the chat screen and notification actions. */
+internal object CallSessionManager {
+    enum class State { RINGING, CONNECTING, CONNECTED }
+    private var callId: String? = null
+    private var state: State? = null
+    private var startedAt = 0L
+
+    @Synchronized fun incoming(id: String): Boolean {
+        if (state == State.RINGING && System.currentTimeMillis() - startedAt > 45_000L) { callId = null; state = null }
+        if (callId == id) return false
+        if (callId != null) return false
+        callId = id; state = State.RINGING; startedAt = System.currentTimeMillis()
+        return true
+    }
+
+    @Synchronized fun accept(id: String): Boolean {
+        if (callId != id || state != State.RINGING) return false
+        state = State.CONNECTING
+        return true
+    }
+
+    @Synchronized fun connected(id: String) {
+        if (callId == id && state == State.CONNECTING) state = State.CONNECTED
+    }
+
+    @Synchronized fun end(id: String) {
+        if (callId == id) { callId = null; state = null }
+    }
+
+    @Synchronized fun current(id: String): State? = if (callId == id) state else null
+}

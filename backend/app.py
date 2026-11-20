@@ -784,6 +784,7 @@ def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_aft
         payload = {'messages': [message_json(row, db) for row in rows], 'receipts': [{'id': row['id'], 'receipt': row['receipt']} for row in receipts], 'events': changes, 'has_more': len(rows) == 100, 'cleared_through': cleared}
     if receipt_cursor.rowcount:
         publish_realtime(peer_id, {'type': 'sync', 'peer_id': me['id']})
+        publish_realtime(me['id'], {'type': 'sync', 'peer_id': peer_id})
     return payload
 
 @app.get('/conversations')
@@ -796,6 +797,9 @@ def conversations(authorization: str | None = Header(default=None)):
         rows = db.execute('''WITH latest AS (
           SELECT CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS peer_id, MAX(id) AS last_id
           FROM messages WHERE (sender_id=? OR recipient_id=?) AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END),0) AND NOT EXISTS(SELECT 1 FROM message_hides h WHERE h.owner_id=? AND h.message_id=messages.id) GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)
-          SELECT p.*, COALESCE(NULLIF(m.text,''),CASE WHEN a.kind='voice' THEN 'Голосовое сообщение' ELSE '📎 Вложение' END) AS last_text, m.id AS last_message_id FROM latest l
-          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id LEFT JOIN attachments a ON a.id=m.attachment_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
-        return {'conversations': [{'profile': public(row), 'last_text': row['last_text'], 'last_message_id': row['last_message_id']} for row in rows]}
+          SELECT p.*, COALESCE(NULLIF(m.text,''),CASE WHEN a.kind='voice' THEN 'Голосовое сообщение' ELSE '📎 Вложение' END) AS last_text, m.id AS last_message_id,
+          (SELECT COUNT(*) FROM messages unread WHERE unread.sender_id=l.peer_id AND unread.recipient_id=? AND unread.read_at IS NULL
+           AND unread.id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=l.peer_id),0)
+           AND NOT EXISTS(SELECT 1 FROM message_hides h WHERE h.owner_id=? AND h.message_id=unread.id)) AS unread_count FROM latest l
+          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id LEFT JOIN attachments a ON a.id=m.attachment_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
+        return {'conversations': [{'profile': public(row), 'last_text': row['last_text'], 'last_message_id': row['last_message_id'], 'unread_count': row['unread_count']} for row in rows]}
