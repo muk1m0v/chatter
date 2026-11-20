@@ -149,8 +149,6 @@ class SalomMessagingService : FirebaseMessagingService() {
     private fun showIncomingCall(data: Map<String, String>) {
         val callId = data["call_id"]?.takeIf { it.length <= 36 } ?: return
         val callerId = data["caller_id"]?.takeIf { it.length <= 36 } ?: return
-        CallSessionManager.incoming(callId)
-        if (CallSessionManager.current(callId) != CallSessionManager.State.RINGING) return
         PushNotifications.createChannel(this)
         val manager = NotificationManagerCompat.from(this)
         val intent = Intent(this, MainActivity::class.java).apply {
@@ -175,7 +173,7 @@ class SalomMessagingService : FirebaseMessagingService() {
             .setTimeoutAfter(45_000).setFullScreenIntent(fullScreen, true).setContentIntent(accept)
             .addAction(0, "Отклонить", decline).addAction(0, "Ответить", accept)
             .build()
-        try { manager.notify("salom-call-$callId", 0, notification) }
+        try { CallSessionManager.notifyWhileRinging(callId) { manager.notify("salom-call-$callId", 0, notification) } }
         catch (_: SecurityException) { /* Notification permission can change while FCM is being handled. */ }
     }
 

@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.Bundle
+import android.os.ResultReceiver
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 
@@ -36,6 +38,13 @@ internal class CallForegroundService : Service() {
             return START_NOT_STICKY
         }
         val callId = intent?.getStringExtra(EXTRA_CALL_ID).orEmpty()
+        @Suppress("DEPRECATION")
+        val result = intent?.getParcelableExtra<ResultReceiver>("promotion_result")
+        if (callId.isEmpty() || CallSessionManager.current(callId) == null) {
+            result?.send(0, null)
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         val peerId = intent?.getStringExtra(EXTRA_PEER_ID).orEmpty()
         val peerName = intent?.getStringExtra(EXTRA_PEER_NAME).orEmpty().ifBlank { "Собеседник" }
         val endIntent = Intent(this, MainActivity::class.java).apply {
@@ -52,12 +61,15 @@ internal class CallForegroundService : Service() {
             .setContentTitle("Звонок Салом").setContentText(peerName)
             .setCategory(NotificationCompat.CATEGORY_CALL).setOngoing(true).setOnlyAlertOnce(true)
             .setContentIntent(pending).addAction(0, "Завершить", pending).build()
-        val cameraAllowed = androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val cameraAllowed = intent?.getBooleanExtra("with_camera", false) == true &&
+            androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
         val type = if (Build.VERSION.SDK_INT >= 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or if (cameraAllowed) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0 else if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
         try {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+            result?.send(1, null)
         } catch (failure: RuntimeException) {
             android.util.Log.e("SalomCall", "Cannot start call foreground service", failure)
+            result?.send(0, null)
             stopSelf(startId)
         }
         return START_NOT_STICKY
@@ -73,12 +85,24 @@ internal class CallForegroundService : Service() {
         private const val EXTRA_PEER_ID = "peer_id"
         private const val EXTRA_PEER_NAME = "peer_name"
 
-        fun start(context: Context, callId: String, peerId: String, peerName: String) {
-            val intent = Intent(context, CallForegroundService::class.java).apply {
-                putExtra(EXTRA_CALL_ID, callId); putExtra(EXTRA_PEER_ID, peerId); putExtra(EXTRA_PEER_NAME, peerName)
+        suspend fun start(context: Context, callId: String, peerId: String, peerName: String, video: Boolean) =
+            kotlinx.coroutines.withTimeout(5_000) {
+                val promoted = kotlinx.coroutines.CompletableDeferred<Boolean>()
+                val result = object : ResultReceiver(android.os.Handler(android.os.Looper.getMainLooper())) {
+                    override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+                        promoted.complete(resultCode == 1)
+                    }
+                }
+                val intent = Intent(context, CallForegroundService::class.java).apply {
+                    putExtra(EXTRA_CALL_ID, callId)
+                    putExtra(EXTRA_PEER_ID, peerId)
+                    putExtra(EXTRA_PEER_NAME, peerName)
+                    putExtra("with_camera", video)
+                    putExtra("promotion_result", result)
+                }
+                androidx.core.content.ContextCompat.startForegroundService(context, intent)
+                check(promoted.await()) { "Android не разрешил запустить микрофон. Открой Салом и попробуй снова." }
             }
-            androidx.core.content.ContextCompat.startForegroundService(context, intent)
-        }
 
         fun stop(context: Context) {
             context.stopService(Intent(context, CallForegroundService::class.java))

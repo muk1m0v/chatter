@@ -54,6 +54,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.withResumed
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -130,83 +132,141 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     var callSpeaker by remember { mutableStateOf(false) }
     var callVideoEnabled by remember { mutableStateOf(true) }
     var callError by remember { mutableStateOf<String?>(null) }
-    var pendingOutgoing by remember { mutableStateOf(false) }
-    val callMicPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
-        val granted = grants[Manifest.permission.RECORD_AUDIO] == true || androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        val call = activeCall
-        if (granted && call == null && pendingOutgoing) {
-            pendingOutgoing = false
-            scope.launch {
-                try {
-                    val result = directory.createCall(person.id)
-                    if (!CallSessionManager.incoming(result.getString("call_id"))) {
-                        runCatching { directory.updateCall(result.getString("call_id"), "cancel") }
-                        error("Другой звонок уже открыт")
+    var pendingOutgoing by remember(person.id) { mutableStateOf<Boolean?>(null) }
+    var pendingAnswer by remember(person.id) { mutableStateOf<CallPresentation?>(null) }
+    var engineReady by remember(person.id) { mutableStateOf(false) }
+    val callLifecycle = LocalLifecycleOwner.current.lifecycle
+
+    fun hasCallPermission(permission: String) =
+        androidx.core.content.ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+
+    fun prepareCall(call: CallPresentation, video: Boolean) {
+        scope.launch {
+            if (activeCall?.callId != call.callId) return@launch
+            try {
+                val engine = CallEngine(context, call.callId, call.peerId, call.peerName, directory, scope, video) { state ->
+                    if (activeCall?.callId == call.callId) {
+                        if (state == "video_unavailable") {
+                            callVideoEnabled = false
+                            callError = "Камера недоступна. Можно продолжить со звуком."
+                        } else activeCall = activeCall?.copy(state = state)
                     }
-                    activeCall = CallPresentation(result.getString("call_id"), person.id, person.name, false, "ringing")
-                    val engine = CallEngine(context, result.getString("call_id"), person.id, person.name, directory, scope) { state -> activeCall = activeCall?.copy(state = state) }
-                    callEngine = engine; engine.prepare()
-                    if (activeCall?.state == "accepted") { activeCall = activeCall?.copy(state = "connecting"); engine.createOffer() }
-                } catch (failure: Exception) {
-                    callEngine?.close(); callEngine = null
-                    activeCall?.let { failed -> activeCall = failed.copy(state = "failed"); scope.launch { runCatching { directory.updateCall(failed.callId, "end") } } }
-                    callError = failure.message ?: "Не удалось начать звонок"; sendError = callError
                 }
-            }
-        } else if (granted && call != null) scope.launch {
-            runCatching {
-                if (call.incoming) directory.updateCall(call.callId, "accept")
-                val engine = CallEngine(context, call.callId, call.peerId, call.peerName, directory, scope) { state -> activeCall = activeCall?.copy(state = state) }
-                callEngine = engine; engine.prepare(); callMuted = false; callSpeaker = false
-                activeCall = call.copy(state = if (call.incoming || call.state == "accepted") "connecting" else "ringing")
-                if (!call.incoming && call.state == "accepted") engine.createOffer()
-                val queued = pendingCallSignals; pendingCallSignals = emptyList()
+                callEngine = engine
+                callMuted = false
+                callSpeaker = false
+                callVideoEnabled = video
+                kotlinx.coroutines.withTimeout(20_000) {
+                    callLifecycle.withResumed { Unit }
+                    engine.prepare()
+                    snapshotFlow { realtimeConnected }.first { it }
+                }
+                if (activeCall?.callId != call.callId) return@launch
+                engineReady = true
+                if (call.incoming) {
+                    android.util.Log.i("SalomCall", "Media and signaling ready, accepting incoming call")
+                    val result = directory.updateCall(call.callId, "accept")
+                    check(result.optString("state") == "accepted") { "Вызов уже завершён" }
+                } else if (CallSessionManager.current(call.callId) == CallSessionManager.State.CONNECTING) {
+                    engine.createOffer()
+                }
+                if (activeCall?.callId != call.callId) return@launch
+                val queued = pendingCallSignals
+                pendingCallSignals = emptyList()
                 queued.forEach { (kind, payload) -> engine.receive(kind, payload) }
-            }.onFailure {
-                callEngine?.close(); callEngine = null
-                activeCall = activeCall?.copy(state = "failed")
-                callError = "Не удалось подключить звонок: ${it.message ?: "проверь интернет"}"
-                scope.launch { runCatching { directory.updateCall(call.callId, "end") } }
-            }
-        } else if (!granted) {
-            pendingOutgoing = false; callError = "Для звонка нужно разрешить доступ к микрофону"; sendError = callError
-            if (call?.incoming == true) {
-                PushNotifications.cancelCall(context, call.callId)
+            } catch (failure: Throwable) {
+                if (failure is CancellationException && failure !is kotlinx.coroutines.TimeoutCancellationException) throw failure
+                if (failure !is Exception && failure !is LinkageError) throw failure
+                android.util.Log.e("SalomCall", "Call setup failed, incoming=" + call.incoming, failure)
+                if (activeCall?.callId != call.callId) return@launch
+                callEngine?.close()
+                callEngine = null
+                engineReady = false
+                pendingCallSignals = emptyList()
                 CallSessionManager.end(call.callId)
-                activeCall = null
-                scope.launch { runCatching { directory.updateCall(call.callId, "decline") } }
+                PushNotifications.cancelCall(context, call.callId)
+                activeCall = activeCall?.copy(state = "failed")
+                callError = if (failure is kotlinx.coroutines.TimeoutCancellationException)
+                    "Не удалось подключиться вовремя. Попробуй ещё раз."
+                else failure.message?.takeIf { failure is DirectoryException } ?: "Не удалось подключить звонок. Проверь доступ к микрофону и сети."
+                runCatching { directory.updateCall(call.callId, "end") }
             }
         }
     }
-    fun requestCallMicrophone() = callMicPermission.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
-    fun startOutgoingCall() {
-        if (saved || activeCall != null) return
-        if (androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED || androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            pendingOutgoing = true
-            callMicPermission.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
-            return
-        }
+
+    fun createOutgoing(video: Boolean) {
         scope.launch {
             try {
-                val result = directory.createCall(person.id)
-                if (!CallSessionManager.incoming(result.getString("call_id"))) {
-                    runCatching { directory.updateCall(result.getString("call_id"), "cancel") }
+                val id = directory.createCall(person.id).getString("call_id")
+                if (!CallSessionManager.incoming(id)) {
+                    runCatching { directory.updateCall(id, "cancel") }
                     error("Другой звонок уже открыт")
                 }
-                activeCall = CallPresentation(result.getString("call_id"), person.id, person.name, false, "ringing")
-                val engine = CallEngine(context, result.getString("call_id"), person.id, person.name, directory, scope) { state -> activeCall = activeCall?.copy(state = state) }
-                callEngine = engine; engine.prepare()
-                if (activeCall?.state == "accepted") { activeCall = activeCall?.copy(state = "connecting"); engine.createOffer() }
+                val call = CallPresentation(id, person.id, person.name, false, "ringing")
+                activeCall = call
+                callError = null
+                prepareCall(call, video)
+            } catch (failure: CancellationException) {
+                throw failure
             } catch (failure: Exception) {
-                callEngine?.close(); callEngine = null
-                activeCall?.let { failed -> activeCall = failed.copy(state = "failed"); scope.launch { runCatching { directory.updateCall(failed.callId, "end") } } }
-                callError = failure.message ?: "Не удалось начать звонок"; sendError = callError
+                sendError = failure.message ?: "Не удалось начать звонок"
+            } finally {
+                pendingOutgoing = null
             }
+        }
+    }
+
+    val callMicPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        val call = pendingAnswer
+        pendingAnswer = null
+        val outgoing = pendingOutgoing
+        if (call != null && activeCall?.callId != call.callId) return@rememberLauncherForActivityResult
+        if (!hasCallPermission(Manifest.permission.RECORD_AUDIO)) {
+            pendingOutgoing = null
+            val message = "Разреши доступ к микрофону в настройках Android, чтобы звонить."
+            if (call != null) {
+                CallSessionManager.end(call.callId)
+                activeCall = call.copy(state = "failed")
+                callError = message
+                scope.launch { runCatching { directory.updateCall(call.callId, "decline") } }
+            } else sendError = message
+        } else if (call != null) {
+            val video = hasCallPermission(Manifest.permission.CAMERA)
+            if (!video) callError = "Камера не разрешена. Звонок продолжится со звуком."
+            prepareCall(call, video)
+        } else if (outgoing != null) {
+            val video = outgoing && hasCallPermission(Manifest.permission.CAMERA)
+            if (outgoing && !video) sendError = "Камера не разрешена. Начинаем аудиозвонок."
+            createOutgoing(video)
+        }
+    }
+
+    fun startOutgoingCall(video: Boolean) {
+        if (saved || activeCall != null || pendingOutgoing != null) return
+        pendingOutgoing = video
+        val permissions = if (video) arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+            else arrayOf(Manifest.permission.RECORD_AUDIO)
+        if (permissions.all(::hasCallPermission)) createOutgoing(video)
+        else callMicPermission.launch(permissions)
+    }
+
+    fun acceptIncomingCall(call: CallPresentation) {
+        if (!CallSessionManager.accept(call.callId)) return
+        PushNotifications.cancelCall(context, call.callId)
+        activeCall = call.copy(state = "connecting")
+        callError = null
+        android.util.Log.i("SalomCall", "Incoming call accepted locally")
+        if (hasCallPermission(Manifest.permission.RECORD_AUDIO)) {
+            prepareCall(call, hasCallPermission(Manifest.permission.CAMERA))
+        } else {
+            pendingAnswer = call
+            callMicPermission.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
         }
     }
     fun endCall(action: String) {
         val call = activeCall ?: return
         CallSessionManager.end(call.callId)
+        engineReady = false
         activeCall = null; callEngine?.close(); callEngine = null; pendingCallSignals = emptyList()
         PushNotifications.cancelCall(context, call.callId)
         scope.launch {
@@ -217,6 +277,15 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
         }
         onCallIntentHandled()
     }
+    DisposableEffect(person.id) {
+        onDispose {
+            activeCall?.let {
+                CallSessionManager.end(it.callId)
+                PushNotifications.cancelCall(context, it.callId)
+            }
+            callEngine?.close()
+        }
+    }
     LaunchedEffect(incomingCall, person.id) {
         incomingCall?.takeIf { it.peerId == person.id }?.let { call ->
             if (activeCall != null && activeCall?.callId != call.callId) return@let
@@ -225,6 +294,10 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 return@let
             }
             val existing = CallSessionManager.current(call.callId)
+            if (call.action == "end" && activeCall?.callId == call.callId) {
+                endCall("end")
+                return@let
+            }
             if (existing == CallSessionManager.State.CONNECTING || existing == CallSessionManager.State.CONNECTED) {
                 activeCall = activeCall ?: CallPresentation(call.callId, call.peerId, call.peerName, true,
                     if (existing == CallSessionManager.State.CONNECTED) "connected" else "connecting")
@@ -233,11 +306,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             }
             activeCall = CallPresentation(call.callId, call.peerId, call.peerName, true, "incoming")
             onCallIntentHandled()
-            if (call.action == "accept" && CallSessionManager.accept(call.callId)) {
-                PushNotifications.cancelCall(context, call.callId)
-                activeCall = activeCall?.copy(state = "connecting")
-                requestCallMicrophone()
-            }
+            if (call.action == "accept") activeCall?.let(::acceptIncomingCall)
             if (call.action == "decline") endCall("decline")
             if (call.action == "end") endCall("end")
         }
@@ -480,17 +549,22 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                             }
                             "call_state" -> if (event.callId == activeCall?.callId && event.state != null) {
                                 if (event.state == "accepted" && activeCall?.incoming == false && CallSessionManager.accept(event.callId.orEmpty())) {
-                                    activeCall = activeCall?.copy(state = if (callEngine == null) "accepted" else "connecting")
-                                    callEngine?.createOffer()
+                                    activeCall = activeCall?.copy(state = "connecting")
+                                    if (engineReady) callEngine?.createOffer()
                                 } else if (event.state in setOf("declined", "cancelled", "ended", "missed")) {
                                     PushNotifications.cancelCall(context, event.callId.orEmpty())
                                     CallSessionManager.end(event.callId.orEmpty())
-                                    callEngine?.close(); callEngine = null; activeCall = null; onCallIntentHandled()
+                                    callEngine?.close(); callEngine = null; activeCall = null
+                                    engineReady = false
+                                    pendingCallSignals = emptyList()
+                                    onCallIntentHandled()
                                 }
                             }
                             "call_signal" -> if (event.callId == activeCall?.callId && event.signalKind != null && event.signalPayload != null) {
                                 val engine = callEngine
-                                if (engine == null) pendingCallSignals = pendingCallSignals + (event.signalKind to event.signalPayload)
+                                if (engine == null || !engineReady) {
+                                    if (pendingCallSignals.size < 128) pendingCallSignals = pendingCallSignals + (event.signalKind to event.signalPayload)
+                                }
                                 else engine.receive(event.signalKind, event.signalPayload)
                             }
                             "closed", "disconnected" -> { realtimeConnected = false; retry++ }
@@ -585,29 +659,31 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     val chatBackground = remember(dark) { Brush.verticalGradient(background) }
     val chatSurface = if (dark) Color(0xFF23303D) else Color.White
     Column(Modifier.fillMaxSize().background(chatBackground).paint(painterResource(chatWallpaperResource(wallpaperId)), contentScale = ContentScale.Crop)) {
-        Row(Modifier.padding(horizontal = 6.dp, vertical = 5.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            ChatAction("back", "Назад", onClick = { if (recording || startingVoice) cancelVoice() else onBack() })
-            Spacer(Modifier.width(4.dp))
-            Row(Modifier.weight(1f).heightIn(min = 42.dp).clip(RoundedCornerShape(24.dp)).background(chatSurface).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(30.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) {
-                    Text(person.initials, color = Ink, fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                    if (!saved && peerOnline) Box(Modifier.align(Alignment.BottomEnd).size(9.dp).clip(CircleShape).background(Color(0xFF40D27A)).border(1.5.dp, chatSurface, CircleShape))
+        Row(
+            Modifier.fillMaxWidth().background(Color(0xFF111721))
+                .heightIn(min = 60.dp).padding(start = 2.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ChatHeaderAction("back", "Назад") { if (recording || startingVoice) cancelVoice() else onBack() }
+            Avatar(person, size = 38)
+            Column(Modifier.weight(1f).padding(start = 9.dp, end = 4.dp)) {
+                Text(person.name, color = Color.White, fontSize = 17.sp, lineHeight = 21.sp,
+                    fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val status = when {
+                    saved -> "Только для тебя"
+                    peerTyping -> "печатает…"
+                    peerOnline -> "в сети"
+                    else -> "не в сети"
                 }
-                Spacer(Modifier.width(8.dp))
-                Column(Modifier.weight(1f).padding(vertical = 3.dp)) {
-                    Text(person.name, fontSize = 14.sp, lineHeight = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (peerTyping) Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("печатает", fontSize = 10.sp, lineHeight = 13.sp, color = Color(0xFF24B566))
-                        Spacer(Modifier.width(4.dp)); TypingDots()
-                    } else Text(if (saved) "Только для тебя" else if (peerOnline) "в сети" else "не в сети", fontSize = 10.sp, lineHeight = 13.sp, maxLines = 1, color = if (peerOnline) Color(0xFF24B566) else MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+                Text(status, color = if (!saved && (peerOnline || peerTyping)) Color(0xFFFFD766) else Color(0xFFB6BECC),
+                    fontSize = 12.sp, lineHeight = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (!saved) Box(Modifier.size(38.dp).clip(CircleShape).background(chatSurface).clickable { startOutgoingCall() }, contentAlignment = Alignment.Center) {
-                Text("☎", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 19.sp)
+            if (!saved) {
+                ChatHeaderAction("video", "Видеозвонок") { startOutgoingCall(true) }
+                ChatHeaderAction("phone", "Аудиозвонок") { startOutgoingCall(false) }
             }
-            Spacer(Modifier.width(4.dp))
             Box {
-                Box(Modifier.size(40.dp).clip(CircleShape).background(chatSurface)) { ChatAction("menu", "Меню диалога", enabled = !busy) { menu = true } }
+                ChatHeaderAction("menu", "Меню диалога", enabled = !busy) { menu = true }
                 DropdownMenu(menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Фон чата") }, onClick = { menu = false; showWallpapers = true })
                     DropdownMenuItem(text = { Text("Очистить диалог") }, onClick = { menu = false; confirmClear = true })
@@ -800,9 +876,10 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             var callSeconds by remember(call.callId) { mutableIntStateOf(0) }
             var localCallRenderer by remember(call.callId) { mutableStateOf<org.webrtc.SurfaceViewRenderer?>(null) }
             var remoteCallRenderer by remember(call.callId) { mutableStateOf<org.webrtc.SurfaceViewRenderer?>(null) }
-            DisposableEffect(call.callId, callEngine, localCallRenderer, remoteCallRenderer) {
-                callEngine?.attachRenderers(localCallRenderer, remoteCallRenderer)
-                onDispose { callEngine?.attachRenderers(null, null) }
+            val rendererEngine = callEngine
+            DisposableEffect(call.callId, rendererEngine, localCallRenderer, remoteCallRenderer) {
+                rendererEngine?.attachRenderers(localCallRenderer, remoteCallRenderer)
+                onDispose { rendererEngine?.attachRenderers(null, null) }
             }
             LaunchedEffect(call.callId, call.state) {
                 if (call.state == "connected") while (isActive) { delay(1_000); callSeconds++ }
@@ -812,9 +889,11 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     Box(Modifier.size(82.dp).clip(CircleShape).background(Yellow), contentAlignment = Alignment.Center) {
                         Text(call.peerName.take(1).uppercase(), fontSize = 34.sp, fontWeight = FontWeight.Bold, color = Ink)
                     }
-                    if (callEngine != null && call.state != "incoming") Box(Modifier.fillMaxWidth().height(210.dp).clip(RoundedCornerShape(18.dp)).background(Color.Black)) {
+                    if (engineReady && (call.incoming || callEngine?.hasLocalVideo == true)) Box(Modifier.fillMaxWidth().height(210.dp).clip(RoundedCornerShape(18.dp)).background(Color.Black)) {
                         AndroidView(factory = { viewContext -> org.webrtc.SurfaceViewRenderer(viewContext).also { CallWebRtc.initRenderer(it, false); remoteCallRenderer = it } }, modifier = Modifier.fillMaxSize(), onRelease = { it.release(); if (remoteCallRenderer === it) remoteCallRenderer = null })
-                        AndroidView(factory = { viewContext -> org.webrtc.SurfaceViewRenderer(viewContext).also { CallWebRtc.initRenderer(it, true); localCallRenderer = it } }, modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).width(92.dp).height(128.dp).clip(RoundedCornerShape(12.dp)), onRelease = { it.release(); if (localCallRenderer === it) localCallRenderer = null })
+                        if (callVideoEnabled && callEngine?.hasLocalVideo == true) {
+                            AndroidView(factory = { viewContext -> org.webrtc.SurfaceViewRenderer(viewContext).also { CallWebRtc.initRenderer(it, true); localCallRenderer = it } }, modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).width(92.dp).height(128.dp).clip(RoundedCornerShape(12.dp)), onRelease = { it.release(); if (localCallRenderer === it) localCallRenderer = null })
+                        }
                     }
                     Text(call.peerName, fontSize = 23.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(callError ?: when (call.state) {
@@ -830,20 +909,13 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                     if (call.state == "incoming") {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                             FilledTonalButton(onClick = { endCall("decline") }) { Text("Отклонить") }
-                            Button(onClick = {
-                                if (CallSessionManager.accept(call.callId)) {
-                                    PushNotifications.cancelCall(context, call.callId)
-                                    activeCall = activeCall?.copy(state = "connecting")
-                                    callError = null
-                                    requestCallMicrophone()
-                                }
-                            }) { Text("Ответить") }
+                            Button(onClick = { acceptIncomingCall(call) }) { Text("Ответить") }
                         }
                     } else {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
                             FilledTonalButton(onClick = { callMuted = !callMuted; callEngine?.setMuted(callMuted) }) { Text(if (callMuted) "Включить микрофон" else "Без звука") }
                             FilledTonalButton(onClick = { callSpeaker = !callSpeaker; callEngine?.setSpeaker(callSpeaker) }) { Text(if (callSpeaker) "Динамик выкл." else "Динамик") }
-                            FilledTonalButton(onClick = { callVideoEnabled = !callVideoEnabled; callEngine?.setVideoEnabled(callVideoEnabled) }) { Text(if (callVideoEnabled) "Камера выкл." else "Камера") }
+                            if (callEngine?.hasLocalVideo == true) FilledTonalButton(onClick = { callVideoEnabled = !callVideoEnabled; callEngine?.setVideoEnabled(callVideoEnabled) }) { Text(if (callVideoEnabled) "Камера выкл." else "Камера") }
                         }
                         Button(onClick = { endCall(if (call.state == "ringing") "cancel" else "end") }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
                             Text("Завершить звонок")
@@ -951,6 +1023,18 @@ internal fun AttachmentBubble(attachment: Attachment, media: MediaFiles, content
 }
 
 @Composable
+private fun ChatHeaderAction(kind: String, label: String, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(
+        Modifier.size(44.dp, 48.dp).clip(CircleShape)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center
+    ) {
+        ChatGlyph(kind, Color.White.copy(alpha = if (enabled) 1f else .4f))
+    }
+}
+
+@Composable
 internal fun ChatAction(kind: String, label: String, enabled: Boolean = true, compact: Boolean = false, onClick: () -> Unit) {
     Box(Modifier.size(if (compact) 36.dp else 40.dp).clip(CircleShape).clickable(enabled = enabled, role = Role.Button, onClick = onClick).semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
         ChatGlyph(kind, MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else .4f))
@@ -961,6 +1045,24 @@ internal fun ChatGlyph(kind: String, color: Color) {
     Canvas(Modifier.size(21.dp)) {
         val w = size.width; val h = size.height; val line = w * .075f
         when (kind) {
+            "video" -> {
+                drawRoundRect(color, Offset(w * .08f, h * .24f), Size(w * .57f, h * .52f),
+                    androidx.compose.ui.geometry.CornerRadius(w * .10f), style = Stroke(line))
+                drawPath(Path().apply {
+                    moveTo(w * .65f, h * .42f); lineTo(w * .91f, h * .28f)
+                    lineTo(w * .91f, h * .72f); lineTo(w * .65f, h * .58f)
+                }, color, style = Stroke(line))
+            }
+            "phone" -> drawPath(Path().apply {
+                moveTo(w * .19f, h * .10f)
+                quadraticTo(w * .10f, h * .11f, w * .12f, h * .25f)
+                cubicTo(w * .19f, h * .59f, w * .49f, h * .87f, w * .82f, h * .89f)
+                quadraticTo(w * .91f, h * .90f, w * .91f, h * .80f)
+                lineTo(w * .90f, h * .69f); lineTo(w * .68f, h * .60f)
+                lineTo(w * .56f, h * .71f)
+                quadraticTo(w * .40f, h * .64f, w * .29f, h * .44f)
+                lineTo(w * .40f, h * .33f); lineTo(w * .32f, h * .11f); close()
+            }, color)
             "mic" -> { drawRoundRect(color, Offset(w*.36f,h*.09f), Size(w*.28f,h*.51f), androidx.compose.ui.geometry.CornerRadius(w*.14f)); drawPath(Path().apply { moveTo(w*.22f,h*.42f); cubicTo(w*.22f,h*.88f,w*.78f,h*.88f,w*.78f,h*.42f) },color,style=Stroke(line)); drawLine(color,Offset(w*.5f,h*.76f),Offset(w*.5f,h*.94f),line); drawLine(color,Offset(w*.33f,h*.94f),Offset(w*.67f,h*.94f),line) }
             "play" -> drawPath(Path().apply { moveTo(w*.3f,h*.16f); lineTo(w*.8f,h*.5f); lineTo(w*.3f,h*.84f); close() },color)
             "pause" -> { drawRoundRect(color,Offset(w*.28f,h*.18f),Size(w*.15f,h*.64f),androidx.compose.ui.geometry.CornerRadius(w*.03f)); drawRoundRect(color,Offset(w*.57f,h*.18f),Size(w*.15f,h*.64f),androidx.compose.ui.geometry.CornerRadius(w*.03f)) }

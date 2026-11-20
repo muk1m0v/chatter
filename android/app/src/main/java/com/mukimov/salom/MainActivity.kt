@@ -169,7 +169,11 @@ private fun SalomApp(context: Context, updater: AppUpdater, notificationPeer: St
         }
     }
     LaunchedEffect(incomingCall, signedIn) {
-        incomingCall?.let { call -> activeChat = Person(call.peerId, call.peerName, call.peerName.take(1).uppercase(), Yellow, "Звонок", avatarUrl = "") }
+        incomingCall?.let { call ->
+            if (activeChat?.id != call.peerId) {
+                activeChat = Person(call.peerId, call.peerName, call.peerName.take(1).uppercase(), Yellow, "Звонок", avatarUrl = "")
+            }
+        }
     }
     val accounts = remember(profileVersion, signedIn) { listOf(SalomAccount("self", store.text("name"), store.text("username"), store.text("phone"), is_active = signedIn)) }
     LaunchedEffect(profileVersion, signedIn) {
@@ -276,7 +280,7 @@ private fun Header(title: String, subtitle: String? = null, trailing: @Composabl
 }
 
 @Composable
-private fun Avatar(person: Person, size: Int = 46) {
+internal fun Avatar(person: Person, size: Int = 46) {
     var photo by remember(person.avatarUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(person.avatarUrl) {
         photo = if(person.avatarUrl.startsWith("https://lh3.googleusercontent.com/") || person.avatarUrl.startsWith("https://googleusercontent.com/"))

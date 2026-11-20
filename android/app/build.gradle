@@ -25,8 +25,8 @@ android {
         applicationId 'com.mukimov.salom'
         minSdk 24
         targetSdk 35
-        versionCode 23
-        versionName '0.15.2'
+        versionCode 24
+        versionName '0.15.3'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         if (salomAbi != null) {
             ndk { abiFilters salomAbi }
@@ -50,7 +50,7 @@ android {
             minifyEnabled true
             shrinkResources true
             signingConfig hasReleaseSigning ? signingConfigs.salomRelease : null
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
     compileOptions {

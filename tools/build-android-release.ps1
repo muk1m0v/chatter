@@ -39,7 +39,7 @@ try {
             if ($LASTEXITCODE -ne 0) { throw "Android release build failed for ABI '$abi' ($LASTEXITCODE)." }
             $builtApk = Join-Path $repo 'android\app\build\outputs\apk\release\app-release.apk'
             if (-not (Test-Path -LiteralPath $builtApk -PathType Leaf)) { throw "Gradle did not produce the release APK for ABI '$abi'." }
-            $fileName = if ($abi) { "SALOM-0.15.2-$abi.apk" } else { 'SALOM-0.15.2.apk' }
+            $fileName = if ($abi) { "SALOM-0.15.3-$abi.apk" } else { 'SALOM-0.15.3.apk' }
             $apk = Join-Path $releaseDir $fileName
             Copy-Item -LiteralPath $builtApk -Destination $apk -Force
             & $signer.FullName verify --verbose --print-certs $apk

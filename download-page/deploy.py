@@ -8,8 +8,9 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 
-incoming = Path('/tmp/salom-deploy')
+incoming = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('/tmp/salom-deploy')
 release_input = json.loads((incoming / 'release.json').read_text(encoding='utf-8'))
 version = release_input.get('version', '')
 display_name = release_input.get('displayName', '')
@@ -27,7 +28,7 @@ windows_file = release_input.get('windowsFile')
 windows_size = None
 windows_sha256 = None
 if windows_file:
-    assert isinstance(windows_file, str) and re.fullmatch(r'SALOM-[0-9.]+-AllowCookie-Setup\.exe', windows_file)
+    assert isinstance(windows_file, str) and re.fullmatch(r'SALOM-[0-9.]+-(?:AllowCookie|CallFix)-Setup\.exe', windows_file)
     windows_installer = incoming / windows_file
     assert windows_installer.is_file() and windows_installer.stat().st_size > 1_000_000
     windows_size = windows_installer.stat().st_size
@@ -49,7 +50,10 @@ for filename in ('salom-latest.apk', 'version.json'):
 if windows_file and (target / windows_file).exists():
     shutil.copy2(target / windows_file, backup / windows_file)
 sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
+if 'sha256' in release_input:
+    assert release_input['sha256'] == sha256, 'Uploaded APK does not match the verified APK'
 old_metadata_path = target / 'version.json'
+old_metadata = {}
 if old_metadata_path.is_file():
     old_metadata = json.loads(old_metadata_path.read_text(encoding='utf-8'))
     old_code = old_metadata.get('versionCode', 0)
@@ -74,6 +78,10 @@ metadata = {'version': version, 'displayName': display_name, 'versionCode': vers
             'releaseNotes': release_notes}
 if windows_file:
     metadata.update({'windowsFile': windows_file, 'windowsSize': windows_size, 'windowsSha256': windows_sha256})
+else:
+    for key in ('windowsFile', 'windowsSize', 'windowsSha256'):
+        if key in old_metadata:
+            metadata[key] = old_metadata[key]
 for file in target.iterdir():
     if file.is_file(): file.chmod(0o644)
 try:
