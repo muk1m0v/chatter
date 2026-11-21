@@ -1,5 +1,7 @@
 """Private bounded attachments; only the sender and visible conversation recipient may read."""
 import json
+import base64
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -7,11 +9,17 @@ import shutil
 import time
 import uuid
 from fastapi import Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 ROOT = Path(os.environ.get('SALOM_MEDIA', '/var/lib/salom-api/attachments'))
 MAX_FILE = 25 * 1024 * 1024
 MAX_ACCOUNT = 200 * 1024 * 1024
+MAX_AVATAR = 512 * 1024
+
+def avatar_schema(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS profile_avatars(
+        owner_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+        revision TEXT NOT NULL, jpeg_base64 TEXT NOT NULL)""")
 
 def schema(db):
     db.executescript('''CREATE TABLE IF NOT EXISTS attachments(
@@ -91,6 +99,38 @@ def verified_mime(declared: str, prefix: bytes, filename: str) -> str:
     return actual
 
 def install_routes(app, connect, current_profile, throttle):
+    @app.put('/profiles/me/avatar')
+    async def put_avatar(request: Request, authorization: str | None = Header(default=None)):
+        owner = current_profile(authorization)['id']
+        throttle('avatar:' + owner, limit=12)
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > MAX_AVATAR:
+                raise HTTPException(413, 'Фото профиля слишком большое')
+            data.extend(chunk)
+        if len(data) < 12 or not data.startswith(b'\xff\xd8\xff') or not data.endswith(b'\xff\xd9'):
+            raise HTTPException(400, 'Выбери фотографию JPEG')
+        revision = hashlib.sha256(data).hexdigest()
+        url = f'https://mukimov.site/salom/api/avatars/{owner}/{revision}.jpg'
+        with connect() as db:
+            db.execute("""INSERT INTO profile_avatars(owner_id,revision,jpeg_base64) VALUES(?,?,?)
+                ON CONFLICT(owner_id) DO UPDATE SET revision=excluded.revision,jpeg_base64=excluded.jpeg_base64""",
+                (owner, revision, base64.b64encode(data).decode('ascii')))
+            db.execute('UPDATE profiles SET avatar_url=?,updated=? WHERE id=?', (url, time.time(), owner))
+        return {'avatar_url': url}
+
+    @app.get('/avatars/{owner}/{revision}.jpg')
+    def get_avatar(owner: uuid.UUID, revision: str):
+        if not re.fullmatch('[0-9a-f]{64}', revision):
+            raise HTTPException(404, 'Аватар недоступен')
+        with connect() as db:
+            row = db.execute("""SELECT a.jpeg_base64 FROM profile_avatars a JOIN profiles p ON p.id=a.owner_id
+                WHERE a.owner_id=? AND a.revision=? AND p.is_active=1""", (str(owner), revision)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Аватар недоступен')
+        return Response(base64.b64decode(row['jpeg_base64']), media_type='image/jpeg',
+                        headers={'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'public, max-age=60'})
+
     @app.post('/attachments')
     async def upload(request: Request, peer_id: str = Query(min_length=36, max_length=36), name: str = Query(min_length=1, max_length=180), kind: str = Query(default='file', pattern='^(file|voice)$'), duration_ms: int = Query(default=0, ge=0, le=300000), waveform: str = Query(default='', max_length=160), authorization: str | None = Header(default=None)):
         owner = current_profile(authorization)['id']

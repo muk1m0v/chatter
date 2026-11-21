@@ -13,6 +13,8 @@ public partial class CallWindow : Window
     private bool _ended;
     private bool _webReady;
     private bool _callAccepted;
+    private bool _mediaConnected;
+    private readonly System.Windows.Threading.DispatcherTimer _leaseTimer = new() { Interval = TimeSpan.FromSeconds(15) };
     private readonly List<JsonElement> _pendingEvents = new();
     private readonly TaskCompletionSource<bool> _mediaReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     internal static CallWindow? Active { get; private set; }
@@ -23,10 +25,12 @@ public partial class CallWindow : Window
         _client = client; _callId = callId; _isCaller = isCaller;
         Title = (isCaller ? "Звоним: " : "Звонок: ") + peerName;
         Active = this;
+        _leaseTimer.Tick += async (_, _) => await RenewLeaseAsync();
         Loaded += InitializeCallAsync;
         Closed += (_, _) =>
         {
             if (Active == this) Active = null;
+            _leaseTimer.Stop();
             if (!_ended) _ = EndCallAsync();
             _ended = true;
         };
@@ -94,7 +98,7 @@ public partial class CallWindow : Window
                 await ProcessEventAsync(pending, pending.TryGetProperty("type", out var eventType) ? eventType.GetString() : null);
             _pendingEvents.Clear();
             CallStatus.Text = _isCaller ? "Звоним…" : "Соединяемся…";
-            if (!_isCaller) { await _client.UpdateCallAsync(_callId, "accept"); _callAccepted = true; }
+            if (!_isCaller) { using var accepted = await _client.UpdateCallAsync(_callId, "accept_leased"); _callAccepted = accepted.RootElement.GetProperty("state").GetString() == "accepted"; if (!_callAccepted) Close(); }
         }
         catch (Exception ex) { CallStatus.Text = "Не удалось запустить звонок: " + ex.Message; }
     }
@@ -110,6 +114,9 @@ public partial class CallWindow : Window
             else if (type == "signal")
                 await _client.SignalCallAsync(_callId, root.GetProperty("kind").GetString()!, root.GetProperty("payload"));
             else if (type == "state")
+            {
+                _mediaConnected = root.GetProperty("value").GetString() == "connected";
+                if (_mediaConnected) _leaseTimer.Start(); else _leaseTimer.Stop();
                 await Dispatcher.InvokeAsync(() => CallStatus.Text = root.GetProperty("value").GetString() switch
                 {
                     "connected" => "Звонок идёт",
@@ -117,6 +124,7 @@ public partial class CallWindow : Window
                     "failed" => "Не удалось соединиться. Проверьте сеть и TURN.",
                     _ => "Звонок · " + root.GetProperty("value").GetString()
                 });
+            }
             else if (type == "hangup")
             {
                 _ended = true;
@@ -137,6 +145,23 @@ public partial class CallWindow : Window
     {
         try { await _client.UpdateCallAsync(_callId, _callAccepted ? "end" : _isCaller ? "cancel" : "decline"); }
         catch { }
+    }
+
+    private async Task RenewLeaseAsync()
+    {
+        _leaseTimer.Stop();
+        if (_ended || !_mediaConnected) return;
+        try
+        {
+            using var response = await _client.UpdateCallAsync(_callId, "heartbeat");
+            if (response.RootElement.GetProperty("state").GetString() != "accepted")
+            {
+                _ended = true;
+                Close();
+            }
+        }
+        catch (Exception) { /* Offline clients cannot renew; the server expires the call. */ }
+        finally { if (!_ended && _mediaConnected) _leaseTimer.Start(); }
     }
 
     internal static async Task<CallWindow?> StartOutgoingAsync(DesktopClient client, string peerId, string peerName, Window owner)

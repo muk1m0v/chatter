@@ -59,6 +59,7 @@ internal class CallEngine(
     private fun reportState(state: String) {
         scope.launch(Dispatchers.Main.immediate) {
             if (!closed) {
+                android.util.Log.i("SalomCall", "WebRTC state: $state")
                 if (state == "connected") CallSessionManager.connected(callId)
                 onState(state)
             }
@@ -235,7 +236,15 @@ internal class CallEngine(
         if (closed) return
         attachRenderers(null, null)
         closed = true
-        runCatching { camera?.stopCapture(); camera?.dispose(); textureHelper?.dispose(); videoTrack?.setEnabled(false); videoTrack?.dispose(); videoSource?.dispose(); track?.setEnabled(false); track?.dispose(); source?.dispose(); peer?.close(); peer?.dispose() }
+        runCatching { camera?.stopCapture() }
+        runCatching { camera?.dispose() }
+        runCatching { textureHelper?.dispose() }
+        runCatching { peer?.close() }
+        runCatching { peer?.dispose() }
+        runCatching { videoTrack?.dispose() }
+        runCatching { videoSource?.dispose() }
+        runCatching { track?.dispose() }
+        runCatching { source?.dispose() }
         camera = null; textureHelper = null; videoTrack = null; videoSource = null; track = null; source = null; peer = null
         runCatching { audioManager.mode = previousMode; audioManager.isSpeakerphoneOn = previousSpeaker }
         runCatching { CallForegroundService.stop(app) }

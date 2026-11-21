@@ -149,6 +149,15 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                         if (state == "video_unavailable") {
                             callVideoEnabled = false
                             callError = "Камера недоступна. Можно продолжить со звуком."
+                        } else if (state == "failed" || state == "ended") {
+                            engineReady = false
+                            callEngine?.close()
+                            callEngine = null
+                            pendingCallSignals = emptyList()
+                            CallSessionManager.end(call.callId)
+                            activeCall = activeCall?.copy(state = "failed")
+                            callError = "Связь прервалась. Попробуй позвонить снова."
+                            directory.finishCall(call.callId)
                         } else activeCall = activeCall?.copy(state = state)
                     }
                 }
@@ -165,7 +174,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 engineReady = true
                 if (call.incoming) {
                     android.util.Log.i("SalomCall", "Media and signaling ready, accepting incoming call")
-                    val result = directory.updateCall(call.callId, "accept")
+                    val result = directory.updateCall(call.callId, "accept_leased")
                     check(result.optString("state") == "accepted") { "Вызов уже завершён" }
                 } else if (CallSessionManager.current(call.callId) == CallSessionManager.State.CONNECTING) {
                     engine.createOffer()
@@ -282,6 +291,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
             activeCall?.let {
                 CallSessionManager.end(it.callId)
                 PushNotifications.cancelCall(context, it.callId)
+                directory.finishCall(it.callId)
             }
             callEngine?.close()
         }
@@ -313,6 +323,22 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
     }
     LaunchedEffect(activeCall?.callId, activeCall?.state) {
         val call = activeCall ?: return@LaunchedEffect
+        if (call.state == "connected") {
+            while (isActive) {
+                val state = try {
+                    directory.updateCall(call.callId, "heartbeat").optString("state")
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+                if (state != null && state != "accepted" && activeCall?.callId == call.callId) {
+                    endCall("end")
+                    return@LaunchedEffect
+                }
+                delay(15_000)
+            }
+        }
         val ringingTimeout = if (call.incoming) call.state == "incoming" else call.state == "ringing"
         val connectingTimeout = call.state in setOf("connecting", "reconnecting")
         if (ringingTimeout || connectingTimeout) {
@@ -349,6 +375,11 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                 draft = ""; selected = null; uploaded = null; replyingTo = null; pendingId = ""; pendingSignature = ""
             }
             sendError = null
+            sent.attachment?.let { photo ->
+                try { media.autoSaveOwnPhoto(photo) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (failure: Exception) { android.util.Log.w("SalomPhotos", "Could not save outgoing photo", failure) }
+            }
             return true
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -550,6 +581,7 @@ internal fun Conversation(person: Person, store: Store, directory: DirectoryClie
                             "call_state" -> if (event.callId == activeCall?.callId && event.state != null) {
                                 if (event.state == "accepted" && activeCall?.incoming == false && CallSessionManager.accept(event.callId.orEmpty())) {
                                     activeCall = activeCall?.copy(state = "connecting")
+                                    scope.launch { runCatching { directory.updateCall(event.callId.orEmpty(), "heartbeat") } }
                                     if (engineReady) callEngine?.createOffer()
                                 } else if (event.state in setOf("declined", "cancelled", "ended", "missed")) {
                                     PushNotifications.cancelCall(context, event.callId.orEmpty())
@@ -986,6 +1018,7 @@ internal fun AttachmentBubble(attachment: Attachment, media: MediaFiles, content
     var bitmap by remember(attachment.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
     var loading by remember(attachment.id) { mutableStateOf(false) }
     var error by remember(attachment.id) { mutableStateOf<String?>(null) }
+    var saveMessage by remember(attachment.id) { mutableStateOf<String?>(null) }
     var attempt by remember { mutableIntStateOf(0) }
     val photo = attachment.mime.startsWith("image/")
     LaunchedEffect(attachment.id, attempt) {
@@ -1019,6 +1052,15 @@ internal fun AttachmentBubble(attachment: Attachment, media: MediaFiles, content
             Column(Modifier.widthIn(max = 185.dp)) { Text(attachment.name, fontSize = 13.sp, lineHeight = 18.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, color = color); Text(fileSize(attachment.size), fontSize = 10.sp, lineHeight = 13.sp, color = color.copy(alpha = .65f)) }
         }
         error?.let { Text(it, fontSize = 10.sp, color = color) }
+        if (Build.VERSION.SDK_INT >= 29 && bitmap != null && SalomPhotos.galleryMime(attachment.mime)) {
+            TextButton(onClick = {
+                scope.launch {
+                    saveMessage = try { media.savePhoto(attachment); "В галерее SALOM" }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { "Не удалось сохранить фото" }
+                }
+            }) { Text(saveMessage ?: "Сохранить фото", color = color, fontSize = 11.sp) }
+        }
     }
 }
 

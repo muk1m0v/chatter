@@ -301,7 +301,7 @@ redis.call('DEL',KEYS[1]); return 1
                     except INTEGRITY_ERRORS: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
             elif existing:
                 if contact['avatar_url']:
-                    db.execute('UPDATE profiles SET avatar_url=? WHERE id=?', (contact['avatar_url'], existing['profile_id']))
+                    db.execute('UPDATE profiles SET avatar_url=? WHERE id=? AND NOT EXISTS (SELECT 1 FROM profile_avatars WHERE owner_id=profiles.id)', (contact['avatar_url'], existing['profile_id']))
                 if not existing['google_linked']:
                     db.execute('UPDATE accounts SET google_linked=1,email=? WHERE profile_id=?', (contact['email'], existing['profile_id']))
                 else:
@@ -319,7 +319,7 @@ redis.call('DEL',KEYS[1]); return 1
                 except INTEGRITY_ERRORS: raise HTTPException(409, 'Этот username уже занят. Выбери другой')
             try:
                 if contact['avatar_url']:
-                    db.execute('UPDATE profiles SET avatar_url=? WHERE id=?', (contact['avatar_url'], target))
+                    db.execute('UPDATE profiles SET avatar_url=? WHERE id=? AND NOT EXISTS (SELECT 1 FROM profile_avatars WHERE owner_id=profiles.id)', (contact['avatar_url'], target))
                 db.execute('INSERT INTO accounts(profile_id,firebase_uid,email,created,google_linked) VALUES(?,?,?,?,1) ON CONFLICT(profile_id) DO UPDATE SET firebase_uid=excluded.firebase_uid,email=excluded.email,google_linked=1',
                            (target, contact['firebase_uid'], contact['email'], now))
             except INTEGRITY_ERRORS: raise HTTPException(409, 'Google уже связан с другим аккаунтом')

@@ -281,11 +281,13 @@ private fun Header(title: String, subtitle: String? = null, trailing: @Composabl
 
 @Composable
 internal fun Avatar(person: Person, size: Int = 46) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val photos = remember(context) { SalomPhotos(context) }
     var photo by remember(person.avatarUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(person.avatarUrl) {
-        photo = if(person.avatarUrl.startsWith("https://lh3.googleusercontent.com/") || person.avatarUrl.startsWith("https://googleusercontent.com/"))
-            runCatching { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { java.net.URL(person.avatarUrl).openConnection().apply { connectTimeout=4000; readTimeout=4000 }.getInputStream().use { android.graphics.BitmapFactory.decodeStream(it) } } }.getOrNull()
-        else null
+        photo = try { photos.avatar(person.avatarUrl) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { null }
     }
     Box(Modifier.size(size.dp).clip(CircleShape).background(person.color), contentAlignment = Alignment.Center) {
         if(photo!=null) androidx.compose.foundation.Image(photo!!.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=androidx.compose.ui.layout.ContentScale.Crop)
@@ -377,12 +379,48 @@ private fun Profile(store: Store, version: Int, directory: DirectoryClient, sync
     val about = remember(version) { store.text("about", "Салом! Я на связи 💛") }
     val username = remember(version) { store.text("username") }
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val photos = remember(context) { SalomPhotos(context) }
+    var avatarBusy by remember { mutableStateOf(false) }
+    var avatarMessage by remember { mutableStateOf<String?>(null) }
+    val picker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) scope.launch {
+            avatarBusy = true
+            avatarMessage = null
+            try {
+                val jpeg = photos.pickedAvatar(uri)
+                val url = directory.uploadAvatar(jpeg)
+                store.save("avatar_url", url)
+                onChanged()
+                runCatching { photos.rememberAvatar(url, jpeg) }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { avatarMessage = "Не удалось сменить фото профиля. Проверь подключение." }
+            finally { avatarBusy = false }
+        }
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(16.dp))
         Avatar(Person("me", name, name.take(1).uppercase(), Yellow, "", avatarUrl=store.text("avatar_url")), 76)
         Spacer(Modifier.height(12.dp))
         Text(name, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
         Text("Мой профиль", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(enabled = !avatarBusy, onClick = {
+                picker.launch(androidx.activity.result.PickVisualMediaRequest(androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }) { Text(if (avatarBusy) "Загрузка…" else "Сменить фото") }
+            if (android.os.Build.VERSION.SDK_INT >= 29 && store.text("avatar_url").isNotBlank()) {
+                TextButton(enabled = !avatarBusy, onClick = {
+                    scope.launch {
+                        avatarMessage = try { photos.saveAvatar(store.text("avatar_url")); "Аватар сохранён в галерее SALOM" }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { "Не удалось сохранить аватар" }
+                    }
+                }) { Text("Сохранить") }
+            }
+        }
+        avatarMessage?.let { Text(it, fontSize = 12.sp) }
         if (syncError != null) Text(syncError, color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(8.dp))
         Spacer(Modifier.height(12.dp))
         Button(onClick = { edit = true }, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("Редактировать профиль", fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
@@ -434,6 +472,8 @@ private fun Detail(value: String, label: String) { Column { Text(value, fontSize
 private fun Settings(updater: AppUpdater, dark: Boolean, onDark: (Boolean) -> Unit, onLogout: () -> Unit) {
     val notificationSettingsContext = androidx.compose.ui.platform.LocalContext.current
     var confirmLogout by remember { mutableStateOf(false) }
+    val photos = remember(notificationSettingsContext) { SalomPhotos(notificationSettingsContext) }
+    var autoSave by remember { mutableStateOf(photos.autoSave) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Header("Настройки", "Сделай Салом своим")
         Card(Modifier.padding(horizontal = 14.dp), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
@@ -441,6 +481,15 @@ private fun Settings(updater: AppUpdater, dark: Boolean, onDark: (Boolean) -> Un
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Тёмная тема", fontWeight = FontWeight.Medium); Text("Для вечерних разговоров", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }; Switch(checked = dark, onCheckedChange = onDark, colors = SwitchDefaults.colors(checkedTrackColor = Yellow, checkedThumbColor = Ink)) }
                 HorizontalDivider(Modifier.padding(vertical = 18.dp))
                 Detail("На этом телефоне", "Хранение заметок")
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Сохранять свои фото из чатов")
+                            Text("Pictures/SALOM/Chat Images", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(checked = autoSave, onCheckedChange = { autoSave = it; photos.autoSave = it })
+                    }
+                }
                 Spacer(Modifier.height(20.dp))
                 Detail(updater.installedDisplayVersion, "Версия Салом")
                 TextButton(onClick = {
