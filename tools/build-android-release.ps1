@@ -1,7 +1,12 @@
-param([switch]$SkipTests)
+param(
+    [switch]$SkipTests,
+    [string]$SigningProfilePath,
+    [ValidateSet('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')]
+    [string[]]$Abis = @()
+)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$profilePath = Join-Path $env:LOCALAPPDATA 'SALOM\release-signing.dpapi'
+$profilePath = if ($SigningProfilePath) { $SigningProfilePath } else { Join-Path $env:LOCALAPPDATA 'SALOM\release-signing.dpapi' }
 if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw 'Protected SALOM signing profile was not found.' }
 
 $protected = [IO.File]::ReadAllBytes($profilePath)
@@ -19,18 +24,28 @@ try {
             & .\gradlew.bat :app:testDebugUnitTest --no-daemon
             if ($LASTEXITCODE -ne 0) { throw "Android unit tests failed ($LASTEXITCODE)." }
         }
-        & .\gradlew.bat :app:assembleRelease --no-daemon
-        if ($LASTEXITCODE -ne 0) { throw "Android release build failed ($LASTEXITCODE)." }
-        $apk = Join-Path $repo 'android\app\build\outputs\apk\release\app-release.apk'
-        if (-not (Test-Path -LiteralPath $apk -PathType Leaf)) { throw 'Gradle did not produce the release APK.' }
+        $buildAbis = if ($Abis.Count -gt 0) { $Abis } else { @('') }
+        $releaseDir = Join-Path $repo 'outputs'
+        New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
         $sdk = $env:ANDROID_SDK_ROOT
         if (-not $sdk) { $sdk = $env:ANDROID_HOME }
         if (-not $sdk) { $sdk = Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
         $signer = Get-ChildItem -LiteralPath (Join-Path $sdk 'build-tools') -Filter apksigner.bat -Recurse | Sort-Object FullName -Descending | Select-Object -First 1
         if (-not $signer) { throw 'Android SDK apksigner was not found.' }
-        & $signer.FullName verify --verbose --print-certs $apk
-        if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
-        Write-Output "Signed APK: $apk"
+        foreach ($abi in $buildAbis) {
+            $gradleArgs = @(':app:assembleRelease', '--no-daemon')
+            if ($abi) { $gradleArgs += "-PsalomAbi=$abi" }
+            & .\gradlew.bat @gradleArgs
+            if ($LASTEXITCODE -ne 0) { throw "Android release build failed for ABI '$abi' ($LASTEXITCODE)." }
+            $builtApk = Join-Path $repo 'android\app\build\outputs\apk\release\app-release.apk'
+            if (-not (Test-Path -LiteralPath $builtApk -PathType Leaf)) { throw "Gradle did not produce the release APK for ABI '$abi'." }
+            $fileName = if ($abi) { "SALOM-0.15.4-$abi.apk" } else { 'SALOM-0.15.4.apk' }
+            $apk = Join-Path $releaseDir $fileName
+            Copy-Item -LiteralPath $builtApk -Destination $apk -Force
+            & $signer.FullName verify --verbose --print-certs $apk
+            if ($LASTEXITCODE -ne 0) { throw "APK signature verification failed for ABI '$abi'." }
+            Write-Output "Signed APK ($($abi ?? 'universal')): $apk"
+        }
     }
     finally { Pop-Location }
 }

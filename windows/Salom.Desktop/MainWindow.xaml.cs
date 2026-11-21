@@ -29,7 +29,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _trayIcon = new System.Windows.Forms.NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = LoadTrayIcon(),
             Text = "Салом",
             Visible = true,
             ContextMenuStrip = new System.Windows.Forms.ContextMenuStrip()
@@ -39,6 +39,14 @@ public partial class MainWindow : Window
         ChatsList.ItemsSource = _chats;
         MessagesList.ItemsSource = _messages;
         Loaded += Window_Loaded;
+    }
+
+    private static System.Drawing.Icon LoadTrayIcon()
+    {
+        var resource = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/assets/salom.ico", UriKind.Absolute))
+            ?? throw new InvalidOperationException("Иконка Салом не включена в приложение.");
+        using var stream = resource.Stream;
+        return new System.Drawing.Icon(stream);
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -62,6 +70,23 @@ public partial class MainWindow : Window
         finally { GoogleButton.IsEnabled = true; }
     }
 
+    private async void EmailSignIn_Click(object sender, RoutedEventArgs e) {
+        var email = Interaction.InputBox("Email для входа:", "Салом · Email").Trim();
+        if (email.Length == 0) return;
+        try {
+            using var sent = await _client.EmailAsync("code", new { email });
+            var code = Interaction.InputBox("6 цифр из письма. Код действует 5 минут.", "Подтверждение Email").Trim();
+            if (code.Length == 0) return;
+            using var verified = await _client.EmailAsync("verify", new { email, code });
+            if (verified.RootElement.TryGetProperty("needs_username", out var needs) && needs.GetBoolean()) {
+                var username = Interaction.InputBox("Выбери username:", "Новый аккаунт");
+                var name = Interaction.InputBox("Твоё имя:", "Новый аккаунт", username);
+                using var registered = await _client.EmailAsync("register", new { email, ticket = verified.RootElement.GetProperty("ticket").GetString(), username, name });
+                _client.AcceptEmail(registered);
+            } else _client.AcceptEmail(verified);
+            await ShowWorkspaceAsync();
+        } catch (Exception error) { LoginStatus.Text = error.Message; }
+    }
     private async Task ShowWorkspaceAsync()
     {
         LoginPane.Visibility = Visibility.Collapsed; Workspace.Visibility = Visibility.Visible;
@@ -136,6 +161,7 @@ public partial class MainWindow : Window
             {
                 using var socket = await _client.ConnectRealtimeAsync("*", cancellationToken);
                 await Dispatcher.InvokeAsync(() => SetConnection("●  онлайн", true));
+                await LoadConversationsAsync();
                 await SyncSelectedChatAsync(false);
                 using var pingCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 var pingTask = SendRealtimePingsAsync(socket, pingCancellation.Token);
@@ -216,9 +242,10 @@ public partial class MainWindow : Window
                 _store.Save(peer.Id, _messages); MessagesScroll.ScrollToEnd();
             }
             else NotifyIncoming(peer.Name, preview);
+            _ = LoadConversationsAsync();
             return;
         }
-        if (type == "sync" && activeChat?.Id == eventPeerId) _ = SyncSelectedChatAsync(false);
+        if (type == "sync") { _ = LoadConversationsAsync(); if (activeChat?.Id == eventPeerId) _ = SyncSelectedChatAsync(false); }
         else if (type == "call_invite") _ = HandleIncomingCallAsync(payload.Clone());
         else if (type is "call_signal" or "call_state") _ = CallWindow.Active?.ReceiveEventAsync(payload.Clone());
     }
@@ -285,6 +312,7 @@ public partial class MainWindow : Window
             foreach (var message in incoming) _messages.Add(message);
             if (incoming.Count > 0) _store.Save(chat.Id, _messages);
             if (incoming.Count > 0) MessagesScroll.ScrollToEnd();
+            if (chat.UnreadCount > 0 || incoming.Count > 0) await LoadConversationsAsync();
             ConnectionState.Text = "●  синхронизировано"; ConnectionState.Foreground = System.Windows.Media.Brushes.LightGreen;
         }
         catch (Exception error)
@@ -296,10 +324,11 @@ public partial class MainWindow : Window
     }
 
     private async void Send_Click(object sender, RoutedEventArgs e) => await SendMessageAsync();
-    private async void MessageBox_KeyDown(object sender, System.Windows.Input.KeyEventArgs e) { if (e.Key == Key.Enter && Keyboard.Modifiers != ModifierKeys.Shift) { e.Handled = true; await SendMessageAsync(); } }
+    private async void MessageBox_KeyDown(object sender, System.Windows.Input.KeyEventArgs e) { if (ComposerInputPolicy.ShouldSend(e.Key == Key.Enter, Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))) { e.Handled = true; await SendMessageAsync(); } }
 
     private async Task SendMessageAsync()
     {
+        if (!SendButton.IsEnabled) return;
         if (_activeChat is null) { ShowToast("Сначала выбери чат"); return; }
         var text = MessageBox.Text.Trim(); if (text.Length == 0) return;
         SendButton.IsEnabled = false;

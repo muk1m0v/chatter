@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import logging
 import threading
 import time
 import uuid
@@ -101,8 +102,9 @@ def initialize():
             'push_jobs': 'message_id,state,attempts,next_at,last_error', 'registrations': 'ip,at', 'auth_limits': 'key,at',
         }
         with connect() as db:
+            media.avatar_schema(db)
             # Additive call schema; safe to apply on existing PostgreSQL installs.
-            db.executescript('''CREATE TABLE IF NOT EXISTS call_sessions (
+            db.executescript('''CREATE TABLE IF NOT EXISTS email_identities (profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE);CREATE TABLE IF NOT EXISTS call_sessions (
               id TEXT PRIMARY KEY, caller_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
               callee_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
               state TEXT NOT NULL, created DOUBLE PRECISION NOT NULL, updated DOUBLE PRECISION NOT NULL,
@@ -179,6 +181,7 @@ def initialize():
           CREATE INDEX IF NOT EXISTS email_challenges_email ON email_challenges(email,created);
         ''')
         media.schema(db)
+        media.avatar_schema(db)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -198,12 +201,16 @@ async def lifespan(app):
         relay_task = asyncio.create_task(redis_event_relay(app), name='salom-redis-event-relay')
     app.state.runtime_metrics = RuntimeMetrics()
     reporter = RuntimeReporter(app.state.runtime_metrics, lambda: app.state.realtime.connection_count)
+    call_reaper = asyncio.create_task(reap_calls(), name='salom-call-reaper')
     try:
         reporter.start()
         app.state.push = PushDispatcher(connect)
         app.state.push.start()
         yield
     finally:
+        call_reaper.cancel()
+        try: await call_reaper
+        except asyncio.CancelledError: pass
         if relay_task:
             relay_task.cancel()
             try: await relay_task
@@ -245,6 +252,25 @@ async def redis_event_relay(application):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 CALL_RING_SECONDS = 45
 CALL_MAX_DURATION_SECONDS = 4 * 60 * 60
+CALL_LEASE_SECONDS = 60
+CALL_FINAL_STATES = ('ended', 'cancelled', 'declined', 'missed')
+
+def expire_accepted_calls():
+    now = time.time()
+    with connect() as db:
+        rows = db.execute("""UPDATE call_sessions SET state='ended',updated=?
+            WHERE state='accepted' AND expires<=? RETURNING id,caller_id,callee_id""", (now, now)).fetchall()
+    for row in rows:
+        publish_realtime(row['caller_id'], {'type':'call_state','peer_id':row['callee_id'],'call_id':row['id'],'state':'ended'})
+        publish_realtime(row['callee_id'], {'type':'call_state','peer_id':row['caller_id'],'call_id':row['id'],'state':'ended'})
+
+async def reap_calls():
+    while True:
+        try:
+            await asyncio.to_thread(expire_accepted_calls)
+        except Exception:
+            logging.getLogger(__name__).exception('Call expiration failed')
+        await asyncio.sleep(10)
 
 def publish_realtime(profile_id: str, event: dict) -> None:
     hub = getattr(app.state, 'realtime', None)
@@ -283,7 +309,8 @@ async def bounds(request: Request, call_next):
     started = time.perf_counter()
     status = 500
     try:
-        if int(request.headers.get('content-length', '0') or 0) > (media.MAX_FILE if request.url.path == '/attachments' else 65536):
+        limits = {'/attachments': media.MAX_FILE, '/profiles/me/avatar': media.MAX_AVATAR}
+        if int(request.headers.get('content-length', '0') or 0) > limits.get(request.url.path, 65536):
             response = JSONResponse({'detail': 'Слишком большой запрос'}, status_code=413)
         else:
             response = await call_next(request)
@@ -610,7 +637,7 @@ def call_config(authorization: str | None = Header(default=None)):
 
 class CallStateInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    action: str = Field(pattern=r'^(accept|decline|cancel|end|missed)$')
+    action: str = Field(pattern=r'^(accept|accept_leased|heartbeat|decline|cancel|end|missed)$')
 
 class CallSignalInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -625,6 +652,10 @@ def create_call(body: CallCreateInput, authorization: str | None = Header(defaul
     if peer_id == me['id']: raise HTTPException(400, 'Нельзя позвонить себе')
     now = time.time(); call_id = str(uuid.uuid4())
     with connect() as db:
+        if PG_DSN:
+            db.execute('SELECT id FROM profiles WHERE id IN (?,?) ORDER BY id FOR UPDATE', (me['id'], peer_id)).fetchall()
+        else:
+            db.execute('BEGIN IMMEDIATE')
         peer = db.execute('SELECT id FROM profiles WHERE id=? AND is_active=1', (peer_id,)).fetchone()
         if not peer: raise HTTPException(404, 'Профиль недоступен')
         active = db.execute("SELECT 1 FROM call_sessions WHERE state IN ('ringing','accepted') AND expires>? AND (caller_id IN (?,?) OR callee_id IN (?,?)) LIMIT 1", (now, me['id'],peer_id,me['id'],peer_id)).fetchone()
@@ -645,18 +676,30 @@ def update_call(call_id: str, body: CallStateInput, authorization: str | None = 
     except ValueError: raise HTTPException(404, 'Звонок не найден')
     now = time.time()
     with connect() as db:
-        call = db.execute('SELECT * FROM call_sessions WHERE id=?', (call_id,)).fetchone()
+        if not PG_DSN:
+            db.execute('BEGIN IMMEDIATE')
+        call = db.execute('SELECT * FROM call_sessions WHERE id=?' + (' FOR UPDATE' if PG_DSN else ''), (call_id,)).fetchone()
         if not call or me['id'] not in (call['caller_id'], call['callee_id']): raise HTTPException(404, 'Звонок не найден')
         state = call['state']; action = body.action
         if state == 'ringing' and call['expires'] <= now: state = 'missed'
+        if state == 'accepted' and call['expires'] <= now: state = 'ended'
         call_expires = call['expires']
-        if action == 'accept' and me['id'] == call['callee_id'] and state == 'ringing':
+        if state in CALL_FINAL_STATES and state == call['state']:
+            return {'call_id':call_id,'state':state}
+        if action == 'heartbeat' and state == 'accepted':
+            deadline = min(now + CALL_LEASE_SECONDS, call['created'] + CALL_MAX_DURATION_SECONDS)
+            db.execute('UPDATE call_sessions SET expires=? WHERE id=?', (deadline, call_id))
+            return {'call_id':call_id,'state':state}
+        if action in ('accept','accept_leased') and me['id'] == call['callee_id'] and state == 'accepted':
+            return {'call_id':call_id,'state':state}
+        if action in ('accept','accept_leased') and me['id'] == call['callee_id'] and state == 'ringing':
             state = 'accepted'
-            call_expires = now + CALL_MAX_DURATION_SECONDS
+            call_expires = now + (CALL_LEASE_SECONDS if action == 'accept_leased' else CALL_MAX_DURATION_SECONDS)
         elif action == 'decline' and me['id'] == call['callee_id'] and state == 'ringing': state = 'declined'
         elif action == 'cancel' and me['id'] == call['caller_id'] and state == 'ringing': state = 'cancelled'
         elif action == 'end' and state in ('accepted','ringing'): state = 'ended'
         elif action == 'missed' and me['id'] == call['callee_id'] and state == 'missed': state = 'missed'
+        elif state in CALL_FINAL_STATES: pass
         else: raise HTTPException(409, 'Это действие уже недоступно')
         db.execute('UPDATE call_sessions SET state=?,updated=?,ended_by=?,expires=? WHERE id=?', (state,now,me['id'] if state in ('declined','cancelled','ended','missed') else None,call_expires,call_id))
         peer_id = call['callee_id'] if me['id'] == call['caller_id'] else call['caller_id']
@@ -784,6 +827,7 @@ def get_messages(peer_id: str, after: int = Query(default=0, ge=0), receipts_aft
         payload = {'messages': [message_json(row, db) for row in rows], 'receipts': [{'id': row['id'], 'receipt': row['receipt']} for row in receipts], 'events': changes, 'has_more': len(rows) == 100, 'cleared_through': cleared}
     if receipt_cursor.rowcount:
         publish_realtime(peer_id, {'type': 'sync', 'peer_id': me['id']})
+        publish_realtime(me['id'], {'type': 'sync', 'peer_id': peer_id})
     return payload
 
 @app.get('/conversations')
@@ -796,6 +840,9 @@ def conversations(authorization: str | None = Header(default=None)):
         rows = db.execute('''WITH latest AS (
           SELECT CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS peer_id, MAX(id) AS last_id
           FROM messages WHERE (sender_id=? OR recipient_id=?) AND id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END),0) AND NOT EXISTS(SELECT 1 FROM message_hides h WHERE h.owner_id=? AND h.message_id=messages.id) GROUP BY peer_id ORDER BY last_id DESC LIMIT 100)
-          SELECT p.*, COALESCE(NULLIF(m.text,''),CASE WHEN a.kind='voice' THEN 'Голосовое сообщение' ELSE '📎 Вложение' END) AS last_text, m.id AS last_message_id FROM latest l
-          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id LEFT JOIN attachments a ON a.id=m.attachment_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
-        return {'conversations': [{'profile': public(row), 'last_text': row['last_text'], 'last_message_id': row['last_message_id']} for row in rows]}
+          SELECT p.*, COALESCE(NULLIF(m.text,''),CASE WHEN a.kind='voice' THEN 'Голосовое сообщение' ELSE '📎 Вложение' END) AS last_text, m.id AS last_message_id,
+          (SELECT COUNT(*) FROM messages unread WHERE unread.sender_id=l.peer_id AND unread.recipient_id=? AND unread.read_at IS NULL
+           AND unread.id>COALESCE((SELECT through_id FROM conversation_clears c WHERE c.owner_id=? AND c.peer_id=l.peer_id),0)
+           AND NOT EXISTS(SELECT 1 FROM message_hides h WHERE h.owner_id=? AND h.message_id=unread.id)) AS unread_count FROM latest l
+          JOIN profiles p ON p.id=l.peer_id JOIN messages m ON m.id=l.last_id LEFT JOIN attachments a ON a.id=m.attachment_id ORDER BY l.last_id DESC''', (me['id'], me['id'], me['id'], me['id'], me['id'], me['id'], me['id'], me['id'], me['id'])).fetchall()
+        return {'conversations': [{'profile': public(row), 'last_text': row['last_text'], 'last_message_id': row['last_message_id'], 'unread_count': row['unread_count']} for row in rows]}

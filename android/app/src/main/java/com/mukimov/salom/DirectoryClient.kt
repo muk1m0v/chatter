@@ -3,6 +3,9 @@ package com.mukimov.salom
 import android.content.Context
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.sync.Mutex
@@ -21,13 +24,16 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 internal class DirectoryException(message: String, val status: Int = 0) : Exception(message)
-internal data class ConversationPreview(val account: SalomAccount, val lastText: String)
+internal data class ConversationPreview(val account: SalomAccount, val lastText: String, val unreadCount: Int = 0)
 internal data class MessageEvent(val id: Long, val messageId: Long, val kind: String, val message: Message? = null)
 internal data class MessageBatch(val messages: List<Message>, val receipts: Map<Long, String>, val events: List<MessageEvent>, val hasMore: Boolean, val clearedThrough: Long)
 internal data class RealtimeEvent(val type: String, val connected: Boolean = false, val online: Boolean? = null, val typing: Boolean? = null, val callId: String? = null, val peerId: String? = null, val callerName: String? = null, val state: String? = null, val signalKind: String? = null, val signalPayload: JSONObject? = null)
 
 /** Private installation/session credential for the Salom API. Google sign-in uses AuthClient. */
 internal class DirectoryClient(context: Context) {
+    companion object {
+        private val callCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    }
     private val identity = context.getSharedPreferences("salom_directory", Context.MODE_PRIVATE)
     private val local = context.getSharedPreferences("salom_local", Context.MODE_PRIVATE)
     private val mutex = Mutex()
@@ -101,6 +107,24 @@ internal class DirectoryClient(context: Context) {
         }
     }
 
+    suspend fun uploadAvatar(jpeg: ByteArray): String = withContext(Dispatchers.IO) {
+        syncLocal()
+        val connection = URL("https://mukimov.site/salom/api/profiles/me/avatar").openConnection() as HttpURLConnection
+        try {
+            connection.connectTimeout = 7000
+            connection.readTimeout = 15000
+            connection.instanceFollowRedirects = false
+            connection.requestMethod = "PUT"
+            connection.doOutput = true
+            connection.setRequestProperty("Authorization", "Bearer $token")
+            connection.setRequestProperty("Content-Type", "image/jpeg")
+            connection.setFixedLengthStreamingMode(jpeg.size)
+            connection.outputStream.use { it.write(jpeg) }
+            if (connection.responseCode != 200) throw DirectoryException("Не удалось загрузить фото профиля", connection.responseCode)
+            connection.inputStream.bufferedReader().use { JSONObject(it.readText()).getString("avatar_url") }
+        } finally { connection.disconnect() }
+    }
+
     suspend fun syncLocal() = withContext(Dispatchers.IO) {
         mutex.withLock {
             val name = local.getString("name", "").orEmpty().trim()
@@ -149,6 +173,12 @@ internal class DirectoryClient(context: Context) {
 
     suspend fun updateCall(callId: String, action: String): JSONObject = withContext(Dispatchers.IO) {
         syncLocal(); request("calls/$callId/state", JSONObject().put("action", action), "POST")
+    }
+
+    fun finishCall(callId: String) {
+        callCleanupScope.launch {
+            runCatching { updateCall(callId, "end") }
+        }
     }
 
     suspend fun signalCall(callId: String, kind: String, payload: JSONObject): JSONObject = withContext(Dispatchers.IO) {
@@ -205,7 +235,7 @@ internal class DirectoryClient(context: Context) {
     suspend fun conversations(): List<ConversationPreview> = withContext(Dispatchers.IO) {
         syncLocal()
         val array = request("conversations").getJSONArray("conversations")
-        (0 until array.length()).map { val item = array.getJSONObject(it); ConversationPreview(account(item.getJSONObject("profile")), item.getString("last_text")) }
+        (0 until array.length()).map { val item = array.getJSONObject(it); ConversationPreview(account(item.getJSONObject("profile")), item.getString("last_text"), item.optInt("unread_count").coerceAtLeast(0)) }
     }
 
     suspend fun registerPush(pushToken: String, enabled: Boolean) = withContext(Dispatchers.IO) {

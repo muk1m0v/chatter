@@ -7,7 +7,7 @@ import secrets
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import uuid
 from fastapi.testclient import TestClient
 import app
@@ -20,12 +20,18 @@ class AuthTests(unittest.TestCase):
         app.DB = Path(self.tmp.name) / 'auth.sqlite3'
         self.credentials = Path(self.tmp.name) / 'project.json'
         self.credentials.write_text(json.dumps({'project_id': 'qa-project'}))
-        self.env = patch.dict(os.environ, {'GOOGLE_APPLICATION_CREDENTIALS': str(self.credentials)})
+        self.env = patch.dict(os.environ, {'GOOGLE_APPLICATION_CREDENTIALS': str(self.credentials),
+                                           'SALOM_DESKTOP_GOOGLE_CLIENT_ID': 'desktop-client-id'})
         self.env.start()
         self.claims = {'sub': 'google-qa', 'email': 'qa@example.invalid', 'email_verified': True,
                        'auth_time': time.time(), 'firebase': {'sign_in_provider': 'google.com'}}
         self.verifier = patch('auth.id_token.verify_firebase_token', side_effect=lambda *a, **k: dict(self.claims))
         self.verify_mock = self.verifier.start()
+        self.google_claims = {'sub': 'desktop-google', 'email': 'desktop@example.invalid', 'email_verified': True, 'name': 'Desktop QA'}
+        self.google_verifier = patch('auth.id_token.verify_oauth2_token', side_effect=lambda *a, **k: dict(self.google_claims))
+        self.google_verify_mock = self.google_verifier.start()
+        self.custom_token = patch('auth.issue_desktop_firebase_token', return_value='firebase-custom-fixture')
+        self.custom_token_mock = self.custom_token.start()
         self.push = patch('app.PushDispatcher')
         self.push.start()
         self.client = TestClient(app.app)
@@ -33,7 +39,7 @@ class AuthTests(unittest.TestCase):
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
-        self.push.stop(); self.verifier.stop(); self.env.stop()
+        self.push.stop(); self.custom_token.stop(); self.google_verifier.stop(); self.verifier.stop(); self.env.stop()
         app.DB = self.previous_db
         self.tmp.cleanup()
 
@@ -80,6 +86,26 @@ class AuthTests(unittest.TestCase):
     def test_invalid_signature_is_rejected(self):
         self.verify_mock.side_effect = ValueError('invalid signature')
         self.assertEqual(self.login().status_code, 401)
+
+    def test_desktop_google_proof_is_verified_for_existing_client_and_bridged(self):
+        response = self.client.post('/auth/desktop/custom-token', json={'google_id_token': 'signed-google-id-token'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {'firebase_custom_token': 'firebase-custom-fixture'})
+        self.assertEqual(self.google_verify_mock.call_args.kwargs['audience'], 'desktop-client-id')
+        self.custom_token_mock.assert_called_once_with(self.google_claims)
+
+    def test_desktop_bridge_rejects_unverified_email_or_invalid_google_signature(self):
+        self.google_claims['email_verified'] = False
+        self.assertEqual(self.client.post('/auth/desktop/custom-token', json={'google_id_token': 'token'}).status_code, 401)
+        self.google_claims['email_verified'] = True
+        self.google_verify_mock.side_effect = ValueError('bad signature')
+        self.assertEqual(self.client.post('/auth/desktop/custom-token', json={'google_id_token': 'token'}).status_code, 401)
+
+    def test_firebase_custom_identity_requires_server_google_claim(self):
+        self.claims['firebase'] = {'sign_in_provider': 'custom'}
+        self.assertEqual(self.login(username='custom_qa', name='QA').status_code, 401)
+        self.claims['salom_google_verified'] = True
+        self.assertEqual(self.login(username='custom_qa', name='QA').status_code, 200)
 
     def test_username_required_then_relogin_keeps_identity(self):
         self.assertTrue(self.login().json()['needs_username'])
@@ -168,5 +194,55 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(self.client.get('/auth/me', headers=self.headers(second)).status_code, 200)
         with app.connect() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM sessions WHERE token_hash=?', (account['session_token'],)).fetchone())
+
+    def test_email_code_is_hashed_and_has_five_minute_ttl(self):
+        redis=MagicMock(); redis.set.return_value=True
+        with patch.object(app.app.state,'redis_sync',redis,create=True), patch.dict(os.environ,{'BREVO_API_KEY':'fixture','BREVO_SENDER_EMAIL':'sender@example.invalid','SALOM_OTP_PEPPER':'x'*32}), patch('auth.requests.post') as mail:
+            response=self.client.post('/auth/email/code',json={'email':'qa@example.invalid'})
+            self.assertEqual(response.status_code,200,response.text)
+            challenge=json.loads(redis.set.call_args_list[1].args[1])
+            sent_code=mail.call_args.kwargs['json']['textContent'].split(': ')[1].split('.')[0]
+            self.assertEqual(challenge['digest'],auth.otp_digest('qa@example.invalid',sent_code))
+            self.assertNotIn(sent_code,redis.set.call_args_list[1].args[1])
+            self.assertEqual(redis.set.call_args_list[1].kwargs['ex'],300)
+            self.assertEqual(mail.call_args.args[0],'https://api.brevo.com/v3/smtp/email')
+
+    def test_email_resend_is_limited(self):
+        redis=MagicMock();redis.set.return_value=False
+        with patch.object(app.app.state,'redis_sync',redis,create=True), patch.dict(os.environ,{'BREVO_API_KEY':'fixture','BREVO_SENDER_EMAIL':'sender@example.invalid'}), patch('auth.requests.post') as mail:
+            self.assertEqual(self.client.post('/auth/email/code',json={'email':'qa@example.invalid'}).status_code,429)
+            mail.assert_not_called()
+
+    def test_email_verification_limits_expiry_and_reuses_google_account(self):
+        account=self.register()
+        redis=MagicMock()
+        with patch.object(app.app.state,'redis_sync',redis,create=True), patch.dict(os.environ,{'SALOM_OTP_PEPPER':'x'*32}):
+            for code,status in [(-1,400),(-2,429),(0,400)]:
+                redis.eval.return_value=code
+                self.assertEqual(self.client.post('/auth/email/verify',json={'email':'qa@example.invalid','code':'123456'}).status_code,status)
+            redis.eval.return_value=1
+            response=self.client.post('/auth/email/verify',json={'email':'qa@example.invalid','code':'123456'})
+            self.assertEqual(response.json()['profile']['id'],account['profile']['id'])
+            self.assertEqual(self.client.get('/auth/me',headers=self.headers(response.json())).status_code,200)
+            with app.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM profiles').fetchone()[0],1)
+
+    def test_google_links_to_verified_email_registration_without_new_profile(self):
+        profile,key=self.seed_legacy('email_user')
+        with app.connect() as db:
+            db.execute('INSERT INTO accounts(profile_id,email,created) VALUES(?,?,?)',(profile,self.claims['email'],time.time()))
+            db.execute('INSERT INTO email_identities(profile_id) VALUES(?)',(profile,))
+        result=self.login()
+        self.assertEqual(result.status_code,200,result.text)
+        self.assertEqual(result.json()['profile']['id'],profile)
+        with app.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM profiles').fetchone()[0],1)
+
+    def test_email_registration_ticket_is_single_use(self):
+        redis=MagicMock();redis.get.return_value='new@example.invalid';redis.getdel.side_effect=['new@example.invalid',None]
+        with patch.object(app.app.state,'redis_sync',redis,create=True):
+            body={'email':'new@example.invalid','ticket':'t'*32,'name':'Email QA','username':'email_qa'}
+            first=self.client.post('/auth/email/register',json=body)
+            self.assertEqual(first.status_code,200,first.text)
+            self.assertEqual(self.client.post('/auth/email/register',json=body).status_code,400)
+            with app.connect() as db: self.assertEqual(db.execute('SELECT count(*) FROM profiles').fetchone()[0],1)
 
 if __name__ == '__main__': unittest.main()

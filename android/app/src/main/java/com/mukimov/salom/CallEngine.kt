@@ -22,6 +22,7 @@ import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /** Audio-only peer connection. Media stays between the two devices; only SDP/ICE is relayed by SALOM. */
@@ -32,6 +33,7 @@ internal class CallEngine(
     private val peerName: String,
     private val directory: DirectoryClient,
     private val scope: CoroutineScope,
+    private val video: Boolean,
     private val onState: (String) -> Unit,
 ) {
     private val app = context.applicationContext
@@ -44,16 +46,29 @@ internal class CallEngine(
     private var textureHelper: SurfaceTextureHelper? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
+    val hasLocalVideo: Boolean get() = videoTrack != null
     private var remoteVideo: VideoTrack? = null
     private var localRenderer: SurfaceViewRenderer? = null
     private var remoteRenderer: SurfaceViewRenderer? = null
     private var peer: PeerConnection? = null
     private val pendingIce = ConcurrentLinkedQueue<IceCandidate>()
+    private var offerStarted = false
+    private var remoteSdpStarted = false
     @Volatile private var remoteDescriptionReady = false
-    private var closed = false
+    @Volatile private var closed = false
+    private fun reportState(state: String) {
+        scope.launch(Dispatchers.Main.immediate) {
+            if (!closed) {
+                android.util.Log.i("SalomCall", "WebRTC state: $state")
+                if (state == "connected") CallSessionManager.connected(callId)
+                onState(state)
+            }
+        }
+    }
 
     suspend fun prepare() {
         if (peer != null) return
+        CallForegroundService.start(app, callId, peerId, peerName, video)
         val iceServers = directory.callConfig().let { array ->
             (0 until array.length()).mapNotNull { index ->
                 val item = array.optJSONObject(index) ?: return@mapNotNull null
@@ -66,6 +81,7 @@ internal class CallEngine(
                 }.createIceServer()
             }
         }
+        check(!closed) { "Звонок уже завершён" }
         val factory = CallWebRtc.factory(app)
         val configuration = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
@@ -74,7 +90,7 @@ internal class CallEngine(
         peer = factory.createPeerConnection(configuration, object : PeerConnection.Observer {
             override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                onState(when (state) {
+                reportState(when (state) {
                     PeerConnection.IceConnectionState.CONNECTED, PeerConnection.IceConnectionState.COMPLETED -> "connected"
                     PeerConnection.IceConnectionState.CHECKING -> "connecting"
                     PeerConnection.IceConnectionState.DISCONNECTED -> "reconnecting"
@@ -98,16 +114,21 @@ internal class CallEngine(
                 (receiver.track() as? AudioTrack)?.setEnabled(true)
             }
             override fun onTrack(transceiver: org.webrtc.RtpTransceiver) {
-                (transceiver.receiver.track() as? AudioTrack)?.setEnabled(true)
-                (transceiver.receiver.track() as? VideoTrack)?.let { video ->
-                    remoteVideo = video; video.setEnabled(true); remoteRenderer?.let(video::addSink)
+                val received = transceiver.receiver.track()
+                scope.launch(Dispatchers.Main) {
+                    if (closed) return@launch
+                    if (received is VideoTrack) {
+                        remoteRenderer?.let { remoteVideo?.removeSink(it) }
+                        remoteVideo = received
+                        remoteRenderer?.let(received::addSink)
+                    }
                 }
             }
         }) ?: error("Не удалось создать аудиозвонок")
         source = factory.createAudioSource(MediaConstraints())
         track = factory.createAudioTrack("salom-audio", source).also { it.setEnabled(true) }
         peer?.addTrack(track, listOf("salom-call"))
-        if (androidx.core.content.ContextCompat.checkSelfPermission(app, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+        if (video) {
             runCatching {
                 val enumerator = Camera2Enumerator(app)
                 val cameraName = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) } ?: enumerator.deviceNames.firstOrNull()
@@ -120,43 +141,46 @@ internal class CallEngine(
                 videoTrack = factory.createVideoTrack("salom-video", videoSource).also { it.setEnabled(true) }
                 peer?.addTrack(videoTrack, listOf("salom-call"))
                 localRenderer?.let { videoTrack?.addSink(it) }
-            }.onFailure { onState("video_unavailable") }
+            }.onFailure { android.util.Log.w("SalomCall", "Camera setup failed", it); reportState("video_unavailable") }
         }
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         audioManager.isSpeakerphoneOn = false
-        CallForegroundService.start(app, callId, peerId, peerName)
     }
 
     fun createOffer() {
-        val connection = checkNotNull(peer)
+        val connection = peer ?: return
+        if (closed || offerStarted) return
+        offerStarted = true
         connection.createOffer(object : SdpObserver {
             override fun onCreateSuccess(description: SessionDescription) {
-                connection.setLocalDescription(object : SdpObserverAdapter() {}, description)
-                scope.launch {
-                    runCatching { directory.signalCall(callId, "offer", JSONObject().put("type", description.type.canonicalForm()).put("sdp", description.description)) }
-                        .onFailure { onState("failed") }
-                }
+                publishLocalSdp(connection, description)
             }
             override fun onSetSuccess() = Unit
-            override fun onCreateFailure(error: String) { onState("failed") }
-            override fun onSetFailure(error: String) { onState("failed") }
+            override fun onCreateFailure(error: String) { reportState("failed") }
+            override fun onSetFailure(error: String) { reportState("failed") }
         }, MediaConstraints())
     }
 
     fun receive(kind: String, payload: JSONObject) {
         val connection = peer ?: return
         when (kind) {
-            "offer" -> {
-                val remote = SessionDescription(SessionDescription.Type.OFFER, payload.optString("sdp"))
+            "offer", "answer" -> {
+                if (remoteSdpStarted || closed) return
+                remoteSdpStarted = true
+                val type = if (kind == "offer") SessionDescription.Type.OFFER else SessionDescription.Type.ANSWER
+                val remote = SessionDescription(type, payload.optString("sdp"))
                 connection.setRemoteDescription(object : SdpObserverAdapter() {
-                    override fun onSetSuccess() { remoteDescriptionReady = true; drainIce(connection); createAnswer() }
-                    override fun onSetFailure(error: String) { onState("failed") }
+                    override fun onSetSuccess() {
+                        scope.launch(Dispatchers.Main) {
+                            if (closed || peer !== connection) return@launch
+                            remoteDescriptionReady = true
+                            drainIce(connection)
+                            if (kind == "offer") createAnswer()
+                        }
+                    }
+                    override fun onSetFailure(error: String) { reportState("failed") }
                 }, remote)
             }
-            "answer" -> connection.setRemoteDescription(object : SdpObserverAdapter() {
-                override fun onSetSuccess() { remoteDescriptionReady = true; drainIce(connection) }
-            },
-                SessionDescription(SessionDescription.Type.ANSWER, payload.optString("sdp")))
             "ice" -> {
                 val mid = payload.optString("sdp_mid").takeIf(String::isNotBlank)
                 val candidate = IceCandidate(mid, payload.optInt("sdp_mline_index"), payload.optString("candidate"))
@@ -170,25 +194,39 @@ internal class CallEngine(
     }
 
     private fun createAnswer() {
-        val connection = checkNotNull(peer)
+        val connection = peer ?: return
         connection.createAnswer(object : SdpObserver {
             override fun onCreateSuccess(description: SessionDescription) {
-                connection.setLocalDescription(object : SdpObserverAdapter() {}, description)
-                scope.launch {
-                    runCatching { directory.signalCall(callId, "answer", JSONObject().put("type", description.type.canonicalForm()).put("sdp", description.description)) }
-                        .onFailure { onState("failed") }
-                }
+                publishLocalSdp(connection, description)
             }
             override fun onSetSuccess() = Unit
-            override fun onCreateFailure(error: String) { onState("failed") }
-            override fun onSetFailure(error: String) { onState("failed") }
+            override fun onCreateFailure(error: String) { reportState("failed") }
+            override fun onSetFailure(error: String) { reportState("failed") }
         }, MediaConstraints())
+    }
+
+    private fun publishLocalSdp(connection: PeerConnection, description: SessionDescription) {
+        scope.launch(Dispatchers.Main) {
+            if (closed || peer !== connection) return@launch
+            connection.setLocalDescription(object : SdpObserverAdapter() {
+                override fun onSetSuccess() {
+                    scope.launch(Dispatchers.Main) {
+                        if (closed) return@launch
+                        val kind = description.type.canonicalForm()
+                        runCatching { directory.signalCall(callId, kind, JSONObject().put("type", kind).put("sdp", description.description)) }
+                            .onFailure { reportState("failed") }
+                    }
+                }
+                override fun onSetFailure(error: String) { reportState("failed") }
+            }, description)
+        }
     }
 
     fun setMuted(muted: Boolean) { track?.setEnabled(!muted) }
     fun setSpeaker(enabled: Boolean) { audioManager.isSpeakerphoneOn = enabled }
     fun setVideoEnabled(enabled: Boolean) { videoTrack?.setEnabled(enabled) }
     fun attachRenderers(local: SurfaceViewRenderer?, remote: SurfaceViewRenderer?) {
+        if (closed) return
         localRenderer?.let { videoTrack?.removeSink(it) }; remoteRenderer?.let { remoteVideo?.removeSink(it) }
         localRenderer = local; remoteRenderer = remote
         local?.let { videoTrack?.addSink(it) }; remote?.let { remoteVideo?.addSink(it) }
@@ -196,12 +234,20 @@ internal class CallEngine(
 
     fun close() {
         if (closed) return
+        attachRenderers(null, null)
         closed = true
-        runCatching { camera?.stopCapture(); camera?.dispose(); textureHelper?.dispose(); videoTrack?.setEnabled(false); videoTrack?.dispose(); videoSource?.dispose(); track?.setEnabled(false); track?.dispose(); source?.dispose(); peer?.close(); peer?.dispose() }
+        runCatching { camera?.stopCapture() }
+        runCatching { camera?.dispose() }
+        runCatching { textureHelper?.dispose() }
+        runCatching { peer?.close() }
+        runCatching { peer?.dispose() }
+        runCatching { videoTrack?.dispose() }
+        runCatching { videoSource?.dispose() }
+        runCatching { track?.dispose() }
+        runCatching { source?.dispose() }
         camera = null; textureHelper = null; videoTrack = null; videoSource = null; track = null; source = null; peer = null
-        audioManager.mode = previousMode
-        audioManager.isSpeakerphoneOn = previousSpeaker
-        CallForegroundService.stop(app)
+        runCatching { audioManager.mode = previousMode; audioManager.isSpeakerphoneOn = previousSpeaker }
+        runCatching { CallForegroundService.stop(app) }
     }
 }
 

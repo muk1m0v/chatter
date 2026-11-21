@@ -21,6 +21,16 @@ internal data class Attachment(val id: String, val name: String, val mime: Strin
     }
 }
 internal class MediaFiles(private val context: Context, private val directory: DirectoryClient) {
+    private val photos = SalomPhotos(context)
+
+    suspend fun savePhoto(attachment: Attachment) = photos.saveChat(attachment, file(attachment), automatic = false)
+
+    suspend fun autoSaveOwnPhoto(attachment: Attachment) {
+        if (android.os.Build.VERSION.SDK_INT >= 29 && !attachment.local && photos.autoSave &&
+            SalomPhotos.galleryMime(attachment.mime)) {
+            photos.saveChat(attachment, file(attachment), automatic = true)
+        }
+    }
     private val lock = Mutex()
     private fun target(attachment: Attachment): File {
         require(runCatching { UUID.fromString(attachment.id) }.isSuccess)
@@ -87,7 +97,7 @@ internal class MediaFiles(private val context: Context, private val directory: D
             val file = target(attachment)
             if (!file.isFile || file.length() != attachment.size) {
                 if (attachment.local) throw DirectoryException("Локальный файл недоступен")
-                directory.downloadAttachment(attachment, file)
+                if (!photos.restoreChat(attachment, file)) directory.downloadAttachment(attachment, file)
                 trimCache(file)
             }
             file

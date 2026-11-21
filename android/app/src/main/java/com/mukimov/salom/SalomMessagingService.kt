@@ -113,8 +113,7 @@ class SalomMessagingService : FirebaseMessagingService() {
         if (local.getString("signed_in", "") != "yes") return
         if (!PushNotifications.allowed(this)) return
         if (message.data["type"] == "incoming_call") {
-            val localCaller = message.data["caller_id"]
-            if (!(local.getBoolean("app_visible", false) && local.getString("active_peer_id", null) == localCaller)) showIncomingCall(message.data)
+            showIncomingCall(message.data)
             return
         }
         if (message.data["type"] == "missed_call") { showMissedCall(message.data); return }
@@ -170,11 +169,11 @@ class SalomMessagingService : FirebaseMessagingService() {
             .setContentTitle(data["caller_name"]?.take(80) ?: "Входящий звонок")
             .setContentText("Голосовой звонок · Салом")
             .setCategory(NotificationCompat.CATEGORY_CALL).setPriority(NotificationCompat.PRIORITY_MAX)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC).setOngoing(true).setAutoCancel(false)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC).setOngoing(true).setAutoCancel(false).setOnlyAlertOnce(true)
             .setTimeoutAfter(45_000).setFullScreenIntent(fullScreen, true).setContentIntent(accept)
             .addAction(0, "Отклонить", decline).addAction(0, "Ответить", accept)
             .build()
-        try { manager.notify("salom-call-$callId", 0, notification) }
+        try { CallSessionManager.notifyWhileRinging(callId) { manager.notify("salom-call-$callId", 0, notification) } }
         catch (_: SecurityException) { /* Notification permission can change while FCM is being handled. */ }
     }
 

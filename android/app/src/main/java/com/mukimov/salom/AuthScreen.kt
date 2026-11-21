@@ -63,6 +63,7 @@ internal fun AuthScreen(context: Context, directory: DirectoryClient, bindCurren
         Text("Салом", fontSize = 42.sp, fontWeight = FontWeight.Bold)
         Text("Ближе к своим 💛", modifier = Modifier.padding(top = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(48.dp))
+        EmailOtpForm(directory, client, onSuccess)
         AnimatedContent(needsUsername, transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(100)) }, label = "google-auth") { choosing ->
             Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 if (!choosing) {
